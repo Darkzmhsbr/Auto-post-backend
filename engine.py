@@ -6,6 +6,7 @@ Processa canais ativos: clona, encaminha ou espiona (ponte) mensagens.
 Suporta posts individuais E álbuns (grouped_id) preservando o agrupamento.
 """
 
+import os
 import asyncio
 import logging
 import json
@@ -18,7 +19,7 @@ from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument,
     MessageMediaWebPage, MessageMediaContact
 )
-from telethon.extensions import html  # 👇 NOVO: Importando a extensão HTML para preservar emojis e formatação
+from telethon.extensions import html  
 
 from database import SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination
 
@@ -253,16 +254,26 @@ async def process_clone(userbot, channel, msg_group, db):
         logger.warning(f"CLONE | Canal {channel.id} sem destinos configurados.")
         return None
 
+    downloaded_paths = [] # Variável para guardar arquivos temporários
+
     try:
-        # Prepara conteúdo uma vez
         if is_album:
             media_files = []
             album_caption = None
             for msg in msg_group:
                 if msg.media:
-                    media_files.append(msg.media)
+                    try:
+                        # 👇 BAIXA A MÍDIA LOCALMENTE PARA BURLAR CANAIS PROTEGIDOS
+                        path = await userbot.download_media(msg.media)
+                        if path:
+                            media_files.append(path)
+                            downloaded_paths.append(path)
+                        else:
+                            media_files.append(msg.media)
+                    except Exception as e:
+                        logger.error(f"Erro ao baixar mídia do álbum (pode falhar se protegido): {e}")
+                        media_files.append(msg.media)
                 
-                # 👇 ATUALIZAÇÃO: Extraindo texto como HTML para manter emojis Premium e formatações
                 raw_text = msg.message or ''
                 if raw_text and getattr(msg, 'entities', None):
                     msg_text = html.unparse(raw_text, msg.entities)
@@ -272,25 +283,23 @@ async def process_clone(userbot, channel, msg_group, db):
                 if msg_text and album_caption is None:
                     album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace)
             
-            # Aplica legenda personalizada
             album_caption = apply_custom_caption(album_caption, channel)
             
             if not media_files:
                 return None
             
-            # Envia para CADA destino
             for dest in all_destinations:
                 try:
                     await dest_client.send_file(
                         dest["dest_channel_id"],
                         file=media_files,
                         caption=album_caption if album_caption else None,
-                        parse_mode='html' # 👇 ATUALIZAÇÃO: Avisando o Telegram que tem formatação
+                        parse_mode='html'
                     )
                     logger.info(f"CLONE ÁLBUM | Canal {channel.id} | {len(media_files)} mídias → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
                 except Exception as e:
                     logger.error(f"CLONE ÁLBUM ERRO | destino {dest['dest_channel_id']}: {e}")
-                await asyncio.sleep(0.5)  # Delay entre destinos
+                await asyncio.sleep(0.5)
             
             queue_entry = create_queue_entry(
                 db, channel.id, first_msg.id, f"album_{len(media_files)}",
@@ -303,7 +312,6 @@ async def process_clone(userbot, channel, msg_group, db):
 
         else:
             msg = first_msg
-            # 👇 ATUALIZAÇÃO: Extraindo texto como HTML para manter emojis Premium
             raw_text = msg.message or ''
             if raw_text and getattr(msg, 'entities', None):
                 text = html.unparse(raw_text, msg.entities)
@@ -313,6 +321,8 @@ async def process_clone(userbot, channel, msg_group, db):
             text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace)
             text = apply_custom_caption(text, channel)
             media_type = "text"
+            
+            downloaded_file = None
 
             if msg.media:
                 if isinstance(msg.media, MessageMediaPhoto):
@@ -321,13 +331,21 @@ async def process_clone(userbot, channel, msg_group, db):
                     media_type = "document"
                 else:
                     media_type = "other_media"
+                    
+                try:
+                    # 👇 BAIXA A MÍDIA ÚNICA PARA BURLAR PROTEÇÃO
+                    downloaded_file = await userbot.download_media(msg.media)
+                    if downloaded_file:
+                        downloaded_paths.append(downloaded_file)
+                except Exception as e:
+                    logger.error(f"Erro ao baixar mídia única: {e}")
 
             for dest in all_destinations:
                 try:
                     if msg.media:
-                        await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=msg.media, parse_mode='html') # 👇 ATUALIZAÇÃO: parse_mode='html'
+                        await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=downloaded_file or msg.media, parse_mode='html')
                     elif text:
-                        await dest_client.send_message(dest["dest_channel_id"], message=text, parse_mode='html') # 👇 ATUALIZAÇÃO: parse_mode='html'
+                        await dest_client.send_message(dest["dest_channel_id"], message=text, parse_mode='html')
                     else:
                         continue
                     logger.info(f"CLONE | Canal {channel.id} | msg {msg.id} → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
@@ -349,6 +367,15 @@ async def process_clone(userbot, channel, msg_group, db):
         create_queue_entry(db, channel.id, first_msg.id, "error", {"error": error_msg, "mode": "clone", "msg_ids": msg_ids}, status="error")
         logger.error(f"CLONE ERRO | Canal {channel.id} | msgs {msg_ids}: {error_msg}")
         return None
+
+    finally:
+        # 👇 LIMPEZA: Apaga os arquivos temporários para não lotar o servidor
+        for path in downloaded_paths:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except:
+                    pass
 
 
 async def process_forward(userbot, channel, msg_group, db):
@@ -437,15 +464,25 @@ async def process_spy(userbot, channel, msg_group, db):
     if not all_destinations:
         all_destinations = [{"dest_channel_id": int(bot_record.dest_channel_id), "dest_channel_name": "Bot Destino"}]
 
+    downloaded_paths = []
+
     try:
         if is_album:
             media_files = []
             album_caption = None
             for msg in msg_group:
                 if msg.media:
-                    media_files.append(msg.media)
+                    try:
+                        path = await userbot.download_media(msg.media)
+                        if path:
+                            media_files.append(path)
+                            downloaded_paths.append(path)
+                        else:
+                            media_files.append(msg.media)
+                    except Exception as e:
+                        logger.error(f"Erro ao baixar mídia do álbum SPY: {e}")
+                        media_files.append(msg.media)
                 
-                # 👇 ATUALIZAÇÃO: Extraindo texto como HTML para ponte
                 raw_text = msg.message or ''
                 if raw_text and getattr(msg, 'entities', None):
                     msg_text = html.unparse(raw_text, msg.entities)
@@ -460,7 +497,7 @@ async def process_spy(userbot, channel, msg_group, db):
                 return None
 
             # PASSO 1: Userbot envia álbum pro Canal Oculto
-            bridge_msgs = await userbot.send_file(bridge_channel_id, file=media_files, caption=album_caption if album_caption else None, parse_mode='html') # 👇 ATUALIZAÇÃO
+            bridge_msgs = await userbot.send_file(bridge_channel_id, file=media_files, caption=album_caption if album_caption else None, parse_mode='html')
             await asyncio.sleep(1.5)
 
             if isinstance(bridge_msgs, list):
@@ -481,7 +518,6 @@ async def process_spy(userbot, channel, msg_group, db):
 
         else:
             msg = first_msg
-            # 👇 ATUALIZAÇÃO: Extraindo HTML para ponte única
             raw_text = msg.message or ''
             if raw_text and getattr(msg, 'entities', None):
                 text = html.unparse(raw_text, msg.entities)
@@ -490,11 +526,20 @@ async def process_spy(userbot, channel, msg_group, db):
 
             text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace)
             text = apply_custom_caption(text, channel)
+            
+            downloaded_file = None
+            if msg.media:
+                try:
+                    downloaded_file = await userbot.download_media(msg.media)
+                    if downloaded_file:
+                        downloaded_paths.append(downloaded_file)
+                except Exception as e:
+                    logger.error(f"Erro ao baixar mídia única SPY: {e}")
 
             if msg.media:
-                bridge_msg = await userbot.send_message(bridge_channel_id, message=text if text else None, file=msg.media, parse_mode='html') # 👇 ATUALIZAÇÃO
+                bridge_msg = await userbot.send_message(bridge_channel_id, message=text if text else None, file=downloaded_file or msg.media, parse_mode='html')
             elif text:
-                bridge_msg = await userbot.send_message(bridge_channel_id, message=text, parse_mode='html') # 👇 ATUALIZAÇÃO
+                bridge_msg = await userbot.send_message(bridge_channel_id, message=text, parse_mode='html')
             else:
                 return None
 
@@ -536,6 +581,13 @@ async def process_spy(userbot, channel, msg_group, db):
         logger.error(f"SPY ERRO | Canal {channel.id} | msgs {msg_ids}: {error_msg}")
         return None
 
+    finally:
+        for path in downloaded_paths:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except:
+                    pass
 
 # ==========================================
 # PROCESSADOR PRINCIPAL DE UM CANAL
