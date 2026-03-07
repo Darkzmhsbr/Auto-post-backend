@@ -135,6 +135,7 @@ class ChannelCreate(BaseModel):
     caption_mode: Optional[str] = "replace"
     caption_keep_title: Optional[bool] = False   # Mantém título original
     userbot_required: Optional[bool] = True      # False = só bot, sem userbot
+    auto_topic_clone: Optional[bool] = False     # 👇 NOVO: Espelhamento Automático de Tópicos
     extra_destinations: Optional[List[DestinationCreate]] = None
 
 # Modelo para edição (todos campos opcionais)
@@ -157,6 +158,7 @@ class ChannelUpdate(BaseModel):
     caption_mode: Optional[str] = None
     caption_keep_title: Optional[bool] = None
     userbot_required: Optional[bool] = None
+    auto_topic_clone: Optional[bool] = None      # 👇 NOVO
 
 class ChannelResponse(BaseModel):
     id: int
@@ -180,6 +182,7 @@ class ChannelResponse(BaseModel):
     caption_mode: Optional[str] = "replace"
     caption_keep_title: Optional[bool] = False
     userbot_required: Optional[bool] = True
+    auto_topic_clone: Optional[bool] = False     # 👇 NOVO
     is_active: bool
     total_forwarded: int
     destinations: Optional[List[DestinationResponse]] = []
@@ -329,6 +332,7 @@ def _serialize_channel(canal, db):
         "caption_mode": canal.caption_mode or "replace",
         "caption_keep_title": getattr(canal, 'caption_keep_title', False) or False,
         "userbot_required": getattr(canal, 'userbot_required', True) if getattr(canal, 'userbot_required', None) is not None else True,
+        "auto_topic_clone": getattr(canal, 'auto_topic_clone', False) or False, # 👇 NOVO
         "is_active": canal.is_active,
         "total_forwarded": canal.total_forwarded or 0,
         "destinations": [],
@@ -391,6 +395,7 @@ def create_channel(canal: ChannelCreate, user_id: str = Depends(get_current_user
         caption_mode=canal.caption_mode or "replace",
         caption_keep_title=canal.caption_keep_title or False,
         userbot_required=canal.userbot_required if canal.userbot_required is not None else True,
+        auto_topic_clone=canal.auto_topic_clone or False, # 👇 NOVO
     )
     db.add(novo_canal)
     db.commit()
@@ -857,6 +862,7 @@ def run_migration(db: Session = Depends(get_db)):
     - Coluna bot_id em autopost_channels_v2
     - Tabela autopost_destinations (múltiplos destinos)
     - Colunas custom_caption, use_custom_caption, caption_mode em autopost_channels_v2
+    - Coluna auto_topic_clone
     """
     from sqlalchemy import text, inspect
     
@@ -884,6 +890,7 @@ def run_migration(db: Session = Depends(get_db)):
             "cta_mode": "VARCHAR DEFAULT 'exact'",
             "caption_keep_title": "BOOLEAN DEFAULT FALSE",
             "userbot_required": "BOOLEAN DEFAULT TRUE",
+            "auto_topic_clone": "BOOLEAN DEFAULT FALSE", # 👇 NOVO: Espelhamento automático de tópicos
         }
         
         for col_name, col_def in new_columns.items():

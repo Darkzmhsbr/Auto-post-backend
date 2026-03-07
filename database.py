@@ -82,6 +82,10 @@ class AutopostChannel(Base):
     # "smart" = manter título original + substituir corpo + CTA
     caption_keep_title = Column(Boolean, default=False)  # Mantém o título da postagem original
     userbot_required = Column(Boolean, default=True)     # False = funciona só com bot, sem userbot
+    
+    # 👇 NOVO: Espelhamento Inteligente de Tópicos (Cria tópicos automaticamente) 👇
+    auto_topic_clone = Column(Boolean, default=False)
+    
     is_active = Column(Boolean, default=True)
     last_post_id = Column(Integer, default=0)
     total_forwarded = Column(Integer, default=0)

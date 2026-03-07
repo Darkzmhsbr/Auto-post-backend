@@ -19,9 +19,10 @@ from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument,
     MessageMediaWebPage, MessageMediaContact
 )
+from telethon.tl.functions.channels import GetForumTopicsRequest, CreateForumTopicRequest
 from telethon.extensions import html  
 
-from database import SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination
+from database import SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination, AutopostTopicMap
 
 # ==========================================
 # CONFIGURAÇÃO
@@ -185,6 +186,109 @@ def group_messages_by_album(messages):
 
 
 # ==========================================
+# ESPELHAMENTO INTELIGENTE DE TÓPICOS
+# ==========================================
+
+async def get_or_create_topic(client, chat_id, topic_name):
+    """Busca um tópico pelo nome no destino. Se não existir, cria automaticamente."""
+    try:
+        # 1. Tenta encontrar o tópico existente
+        topics = await client(GetForumTopicsRequest(
+            channel=chat_id,
+            q=topic_name,
+            offset_date=0,
+            offset_id=0,
+            offset_topic=0,
+            limit=100
+        ))
+        for t in topics.topics:
+            if getattr(t, 'title', '') == topic_name:
+                return t.id
+    except Exception as e:
+        # Falha silenciosamente (o destino pode não ser um fórum)
+        pass
+
+    # 2. Se não encontrou, cria o tópico
+    try:
+        result = await client(CreateForumTopicRequest(
+            channel=chat_id,
+            title=topic_name
+        ))
+        for update in result.updates:
+            if hasattr(update, 'message') and hasattr(update.message, 'id'):
+                logger.info(f"✨ Tópico Inteligente criado: '{topic_name}' no chat {chat_id}")
+                return update.message.id
+    except Exception as e:
+        logger.error(f"Erro ao criar tópico '{topic_name}' em {chat_id}: {e}")
+    
+    return None
+
+async def resolve_dest_topics(userbot, dest_client, channel, first_msg, all_destinations, db):
+    """
+    Descobre se a postagem veio de um tópico na origem.
+    Se sim, verifica o banco (mapa manual) ou cria automaticamente (Espelhamento Inteligente).
+    Retorna dict: { dest_channel_id: dest_topic_id }
+    """
+    dest_topic_ids = {}
+    origin_topic_id = None
+    
+    # Verifica se a mensagem original veio de um fórum/tópico
+    if first_msg.reply_to and getattr(first_msg.reply_to, 'forum_topic', False):
+        origin_topic_id = getattr(first_msg.reply_to, 'reply_to_top_id', None) or getattr(first_msg.reply_to, 'reply_to_msg_id', None)
+    
+    if origin_topic_id:
+        topic_name = None
+        
+        for dest in all_destinations:
+            dest_id = dest["dest_channel_id"]
+            
+            # 1. Prioridade: Verifica se existe mapeamento manual
+            mapped = db.query(AutopostTopicMap).filter(
+                AutopostTopicMap.channel_id == channel.id,
+                AutopostTopicMap.origin_topic_id == origin_topic_id
+            ).first()
+            
+            if mapped and mapped.dest_topic_id:
+                dest_topic_ids[dest_id] = int(mapped.dest_topic_id)
+                
+            # 2. Se não tem mapa e o Espelhamento Automático está LIGADO
+            elif getattr(channel, 'auto_topic_clone', False):
+                
+                # Obtém o nome do tópico na origem (apenas 1x por tick)
+                if topic_name is None:
+                    topic_name = f"Tópico {origin_topic_id}"
+                    try:
+                        topic_msg = await userbot.get_messages(int(channel.origin_channel_id), ids=origin_topic_id)
+                        if topic_msg and hasattr(topic_msg, 'action') and hasattr(topic_msg.action, 'title'):
+                            topic_name = topic_msg.action.title
+                    except Exception as e:
+                        logger.error(f"Erro ao ler nome do tópico na origem: {e}")
+                        
+                # Resolve no destino (Busca ou Cria)
+                d_topic_id = await get_or_create_topic(dest_client, dest_id, topic_name)
+                
+                if d_topic_id:
+                    dest_topic_ids[dest_id] = d_topic_id
+                    
+                    # Salva no banco para funcionar como cache na próxima vez
+                    if not mapped:
+                        try:
+                            new_map = AutopostTopicMap(
+                                channel_id=channel.id,
+                                origin_topic_id=origin_topic_id,
+                                origin_topic_name=topic_name,
+                                dest_topic_id=d_topic_id,
+                                dest_topic_name=topic_name
+                            )
+                            db.add(new_map)
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                            
+    return dest_topic_ids
+
+
+# ==========================================
 # GERENCIAMENTO DE CLIENTES TELETHON
 # ==========================================
 async def get_userbot_client(session_record):
@@ -257,13 +361,13 @@ def _get_bot_record(channel, db):
 
 
 # ==========================================
-# PROCESSADORES POR MODO (COM SUPORTE A ÁLBUM)
+# PROCESSADORES POR MODO (COM SUPORTE A ÁLBUM E TÓPICOS)
 # ==========================================
 
 async def process_clone(userbot, channel, msg_group, db):
     """
     MODO CLONE: Copia texto/mídia e reposta como novo.
-    Suporta álbuns, múltiplos destinos, e legenda personalizada.
+    Suporta álbuns, múltiplos destinos, tópicos e legenda personalizada.
     """
     dest_client = userbot
     bot_record = _get_bot_record(channel, db)
@@ -284,7 +388,9 @@ async def process_clone(userbot, channel, msg_group, db):
         logger.warning(f"CLONE | Canal {channel.id} sem destinos configurados.")
         return None
 
-    downloaded_paths = [] # Variável para guardar arquivos temporários
+    # 👇 RESOLUÇÃO INTELIGENTE DE TÓPICOS
+    dest_topic_ids = await resolve_dest_topics(userbot, dest_client, channel, first_msg, all_destinations, db)
+    downloaded_paths = []
 
     try:
         if is_album:
@@ -293,7 +399,6 @@ async def process_clone(userbot, channel, msg_group, db):
             for msg in msg_group:
                 if msg.media:
                     try:
-                        # 👇 BAIXA A MÍDIA LOCALMENTE PARA BURLAR CANAIS PROTEGIDOS
                         path = await userbot.download_media(msg.media)
                         if path:
                             media_files.append(path)
@@ -319,12 +424,14 @@ async def process_clone(userbot, channel, msg_group, db):
                 return None
             
             for dest in all_destinations:
+                reply_to_id = dest_topic_ids.get(dest["dest_channel_id"])
                 try:
                     await dest_client.send_file(
                         dest["dest_channel_id"],
                         file=media_files,
                         caption=album_caption if album_caption else None,
-                        parse_mode='html'
+                        parse_mode='html',
+                        reply_to=reply_to_id
                     )
                     logger.info(f"CLONE ÁLBUM | Canal {channel.id} | {len(media_files)} mídias → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
                 except Exception as e:
@@ -363,7 +470,6 @@ async def process_clone(userbot, channel, msg_group, db):
                     media_type = "other_media"
                     
                 try:
-                    # 👇 BAIXA A MÍDIA ÚNICA PARA BURLAR PROTEÇÃO
                     downloaded_file = await userbot.download_media(msg.media)
                     if downloaded_file:
                         downloaded_paths.append(downloaded_file)
@@ -371,11 +477,12 @@ async def process_clone(userbot, channel, msg_group, db):
                     logger.error(f"Erro ao baixar mídia única: {e}")
 
             for dest in all_destinations:
+                reply_to_id = dest_topic_ids.get(dest["dest_channel_id"])
                 try:
                     if msg.media:
-                        await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=downloaded_file or msg.media, parse_mode='html')
+                        await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=downloaded_file or msg.media, parse_mode='html', reply_to=reply_to_id)
                     elif text:
-                        await dest_client.send_message(dest["dest_channel_id"], message=text, parse_mode='html')
+                        await dest_client.send_message(dest["dest_channel_id"], message=text, parse_mode='html', reply_to=reply_to_id)
                     else:
                         continue
                     logger.info(f"CLONE | Canal {channel.id} | msg {msg.id} → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
@@ -399,7 +506,6 @@ async def process_clone(userbot, channel, msg_group, db):
         return None
 
     finally:
-        # 👇 LIMPEZA: Apaga os arquivos temporários para não lotar o servidor
         for path in downloaded_paths:
             if os.path.exists(path):
                 try:
@@ -409,8 +515,7 @@ async def process_clone(userbot, channel, msg_group, db):
 
 async def process_forward(userbot, channel, msg_group, db):
     """
-    MODO FORWARD: Encaminha nativamente para múltiplos destinos.
-    forward_messages com lista de IDs preserva álbuns.
+    MODO FORWARD: Encaminha nativamente para múltiplos destinos (com suporte a tópicos).
     """
     dest_client = userbot
     bot_record = _get_bot_record(channel, db)
@@ -429,13 +534,18 @@ async def process_forward(userbot, channel, msg_group, db):
         logger.warning(f"FORWARD | Canal {channel.id} sem destinos configurados.")
         return None
 
+    # 👇 RESOLUÇÃO INTELIGENTE DE TÓPICOS
+    dest_topic_ids = await resolve_dest_topics(userbot, dest_client, channel, first_msg, all_destinations, db)
+
     try:
         for dest in all_destinations:
+            reply_to_id = dest_topic_ids.get(dest["dest_channel_id"])
             try:
                 await dest_client.forward_messages(
                     dest["dest_channel_id"],
                     msg_ids,
-                    int(channel.origin_channel_id)
+                    int(channel.origin_channel_id),
+                    reply_to=reply_to_id
                 )
                 if is_album:
                     logger.info(f"FORWARD ÁLBUM | Canal {channel.id} | {len(msg_ids)} msgs → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
@@ -466,10 +576,7 @@ async def process_forward(userbot, channel, msg_group, db):
 
 async def process_spy(userbot, channel, msg_group, db):
     """
-    MODO ESPIONAR (PONTE PREMIUM) com múltiplos destinos:
-    1. Userbot lê do concorrente
-    2. Userbot clona pro Canal Oculto (com legenda personalizada se configurada)
-    3. Bot oficial encaminha do Canal Oculto → TODOS os destinos configurados
+    MODO ESPIONAR (PONTE PREMIUM) com espelhamento de tópicos.
     """
     if not channel.bot_id:
         logger.warning(f"SPY | Canal {channel.id} sem bot vinculado. Fazendo clone direto.")
@@ -488,11 +595,13 @@ async def process_spy(userbot, channel, msg_group, db):
     msg_ids = [m.id for m in msg_group]
     bridge_channel_id = int(bot_record.origin_channel_id)
     
-    # Coleta todos os destinos (principal + extras)
     all_destinations = get_all_dest_channel_ids(channel, db)
     if not all_destinations:
         all_destinations = [{"dest_channel_id": int(bot_record.dest_channel_id), "dest_channel_name": "Bot Destino"}]
 
+    # 👇 RESOLUÇÃO INTELIGENTE DE TÓPICOS
+    # Nota: Aqui o dest_client repassado é o bot_client (que fará a postagem final)
+    dest_topic_ids = await resolve_dest_topics(userbot, bot_client, channel, first_msg, all_destinations, db)
     downloaded_paths = []
 
     try:
@@ -534,10 +643,11 @@ async def process_spy(userbot, channel, msg_group, db):
             else:
                 bridge_msg_ids = [bridge_msgs.id]
 
-            # PASSO 2: Bot encaminha para TODOS os destinos
+            # PASSO 2: Bot encaminha para TODOS os destinos (com suporte a tópicos)
             for dest in all_destinations:
+                reply_to_id = dest_topic_ids.get(dest["dest_channel_id"])
                 try:
-                    await bot_client.forward_messages(dest["dest_channel_id"], bridge_msg_ids, bridge_channel_id)
+                    await bot_client.forward_messages(dest["dest_channel_id"], bridge_msg_ids, bridge_channel_id, reply_to=reply_to_id)
                     logger.info(f"SPY ÁLBUM PONTE | Canal {channel.id} → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
                 except Exception as e:
                     logger.error(f"SPY ÁLBUM ERRO | destino {dest['dest_channel_id']}: {e}")
@@ -576,8 +686,9 @@ async def process_spy(userbot, channel, msg_group, db):
             bridge_msg_ids = [bridge_msg.id]
 
             for dest in all_destinations:
+                reply_to_id = dest_topic_ids.get(dest["dest_channel_id"])
                 try:
-                    await bot_client.forward_messages(dest["dest_channel_id"], bridge_msg_ids, bridge_channel_id)
+                    await bot_client.forward_messages(dest["dest_channel_id"], bridge_msg_ids, bridge_channel_id, reply_to=reply_to_id)
                     logger.info(f"SPY PONTE | Canal {channel.id} | msg {first_msg.id} → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
                 except Exception as e:
                     logger.error(f"SPY ERRO | destino {dest['dest_channel_id']}: {e}")
@@ -641,13 +752,11 @@ async def process_channel(channel, session_record, db):
     if last_sent and last_sent.sent_at:
         last_dt = last_sent.sent_at
         
-        # 👇 ATUALIZAÇÃO 1: Correção definitiva do fuso horário para garantir que o intervalo avance
+        # 👇 Correção definitiva do fuso horário para garantir que o intervalo avance
         if last_dt.tzinfo is None:
-            # Pegamos o tempo decorrido considerando que o banco salvou como Local ou como UTC
             elapsed_local = (now_brazil().replace(tzinfo=None) - last_dt).total_seconds()
             elapsed_utc = (datetime.utcnow() - last_dt).total_seconds()
             
-            # Escolhemos o cenário correto (tem que ser positivo e coerente)
             if elapsed_local >= 0 and elapsed_utc >= 0:
                 elapsed = min(elapsed_local, elapsed_utc)
             elif elapsed_utc >= 0:
@@ -655,7 +764,7 @@ async def process_channel(channel, session_record, db):
             elif elapsed_local >= 0:
                 elapsed = elapsed_local
             else:
-                elapsed = abs(elapsed_local) # Fallback extremo para evitar travar no negativo
+                elapsed = abs(elapsed_local)
         else:
             elapsed = (now_brazil() - last_dt).total_seconds()
 
@@ -711,8 +820,7 @@ async def process_channel(channel, session_record, db):
         else:
             result = await process_clone(userbot, channel, group, db)
 
-        # 👇 ATUALIZAÇÃO 2: Sempre avançamos o ID do canal! 
-        # Isso evita que a automação fique tentando clonar a mesma mensagem defeituosa eternamente (loop infinito)
+        # 👇 Sempre avançamos o ID do canal para evitar loop
         group_max_id = max(m.id for m in group)
         if group_max_id > (channel.last_post_id or 0):
             channel.last_post_id = group_max_id
@@ -734,7 +842,7 @@ async def process_channel(channel, session_record, db):
             })
             return 1
             
-        return 0 # Caso result seja None (deu erro no envio da mensagem, mas o ID foi avançado)
+        return 0
 
     except Exception as e:
         logger.error(f"Erro ao processar canal {channel.id}: {e}")
@@ -848,7 +956,7 @@ def start_engine():
         coalesce=True
     )
     _scheduler.start()
-    logger.info("🚀 AutoPost Engine v3 (Multi-Dest + Custom Caption) iniciado! Tick a cada 30s.")
+    logger.info("🚀 AutoPost Engine v3 (Multi-Dest + Smart Topics + Custom Caption) iniciado! Tick a cada 30s.")
 
 
 def stop_engine():
