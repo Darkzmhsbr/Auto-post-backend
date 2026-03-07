@@ -407,7 +407,6 @@ async def process_clone(userbot, channel, msg_group, db):
                 except:
                     pass
 
-
 async def process_forward(userbot, channel, msg_group, db):
     """
     MODO FORWARD: Encaminha nativamente para múltiplos destinos.
