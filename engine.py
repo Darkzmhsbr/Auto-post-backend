@@ -66,26 +66,30 @@ def apply_cta_replacement(text, cta_find, cta_replace, cta_mode="exact"):
     
     Modos:
     - "exact": Busca exata (substitui apenas o texto idêntico ao cta_find)
-    - "smart": Detecta TODOS os links t.me/...Bot e similares e substitui pelo cta_replace
+    - "smart": Detecta TODOS os links t.me/ (tanto em texto plano quanto em tags <a href>)
+               e substitui pelo cta_replace, preservando a formatação HTML.
     """
     if not text or not cta_replace:
         return text
     
     if cta_mode == "smart":
         import re
-        # Detecta links de bots do Telegram: https://t.me/NomeBot?start=xxx
-        # Também pega variações: t.me/Nome01Bot, t.me/Nome02Bot, etc.
-        # E links genéricos com http/https
-        patterns = [
-            r'https?://t\.me/\S+',          # Links t.me completos
-            r't\.me/\S+',                     # Links t.me sem http
-            r'https?://telegram\.me/\S+',     # Links telegram.me
-        ]
-        combined_pattern = '|'.join(patterns)
         
-        # Substitui TODOS os links encontrados pelo cta_replace
-        result = re.sub(combined_pattern, cta_replace, text)
-        return result
+        # 1. Substitui links dentro de tags <a href="..."> (preserva a tag, troca só a URL)
+        def replace_href(match):
+            return f'<a href="{cta_replace}">'
+        text = re.sub(r'<a\s+href="https?://t\.me/[^"]*">', replace_href, text)
+        text = re.sub(r'<a\s+href="https?://telegram\.me/[^"]*">', replace_href, text)
+        
+        # 2. Substitui links t.me em texto plano (que NÃO estejam dentro de um href="...")
+        # Usa negative lookbehind para não pegar os que já estão dentro de href=""
+        text = re.sub(r'(?<!href=")(?<!href=\')https?://t\.me/\S+', cta_replace, text)
+        text = re.sub(r'(?<!href=")(?<!href=\')https?://telegram\.me/\S+', cta_replace, text)
+        
+        # 3. Links sem http (t.me/Bot) em texto plano
+        text = re.sub(r'(?<!["/])(?<!\w)t\.me/\S+', cta_replace, text)
+        
+        return text
     else:
         # Modo exato (legado)
         if not cta_find:
@@ -619,10 +623,27 @@ async def process_spy(userbot, channel, msg_group, db):
 # PROCESSADOR PRINCIPAL DE UM CANAL
 # ==========================================
 async def process_channel(channel, session_record, db):
-    """Processa um canal ativo: lê mensagens novas, agrupa álbuns, e despacha"""
+    """
+    Processa um canal ativo: lê mensagens novas, agrupa álbuns, e despacha.
+    
+    RESPEITA interval_minutes: só envia 1 post/álbum por vez.
+    O engine roda a cada 30s, mas só envia se o tempo desde o último envio >= interval_minutes.
+    """
 
     if not is_within_schedule(channel):
         return 0
+
+    # Verifica se já passou o intervalo desde o último envio
+    last_sent = db.query(AutopostQueue).filter(
+        AutopostQueue.channel_pair_id == channel.id,
+        AutopostQueue.status == "sent"
+    ).order_by(AutopostQueue.id.desc()).first()
+
+    if last_sent and last_sent.sent_at:
+        elapsed = (now_brazil() - last_sent.sent_at.replace(tzinfo=BRAZIL_TZ) if last_sent.sent_at.tzinfo is None else now_brazil() - last_sent.sent_at).total_seconds()
+        interval_seconds = (channel.interval_minutes or 5) * 60
+        if elapsed < interval_seconds:
+            return 0  # Ainda não deu tempo, espera o próximo tick
 
     userbot = await get_userbot_client(session_record)
     if not userbot:
@@ -636,7 +657,6 @@ async def process_channel(channel, session_record, db):
         origin_id = int(channel.origin_channel_id)
         min_id = channel.last_post_id or 0
 
-        # Busca mais mensagens para capturar álbuns completos
         messages = await userbot.get_messages(
             origin_id,
             min_id=min_id,
@@ -646,65 +666,53 @@ async def process_channel(channel, session_record, db):
         if not messages:
             return 0
 
-        # Filtra mensagens realmente novas
         new_messages = [m for m in messages if m.id > min_id and (m.message is not None or m.media is not None)]
 
         if not new_messages:
             return 0
 
-        # Ordena por ID (mais antigo primeiro)
         new_messages.sort(key=lambda m: m.id)
-
-        # ===== AGRUPAMENTO DE ÁLBUNS =====
         msg_groups = group_messages_by_album(new_messages)
 
-        # Aplica ordem configurada (nos grupos, não msgs individuais)
         if channel.post_order == 'lifo':
             msg_groups.reverse()
         elif channel.post_order == 'random':
             import random
             random.shuffle(msg_groups)
 
-        processed = 0
-        max_group_id = min_id
+        if not msg_groups:
+            return 0
 
-        for group in msg_groups:
-            if channel.channel_type == 'forward':
-                result = await process_forward(userbot, channel, group, db)
-            elif channel.channel_type == 'spy':
-                result = await process_spy(userbot, channel, group, db)
-            else:
-                result = await process_clone(userbot, channel, group, db)
+        # ===== PEGA APENAS O PRÓXIMO GRUPO (1 post ou 1 álbum por tick) =====
+        group = msg_groups[0]
 
-            if result:
-                processed += 1
-                group_max_id = max(m.id for m in group)
-                if group_max_id > max_group_id:
-                    max_group_id = group_max_id
-                channel.total_forwarded = (channel.total_forwarded or 0) + 1
-                db.commit()
+        if channel.channel_type == 'forward':
+            result = await process_forward(userbot, channel, group, db)
+        elif channel.channel_type == 'spy':
+            result = await process_spy(userbot, channel, group, db)
+        else:
+            result = await process_clone(userbot, channel, group, db)
 
-            # Delay: 2.5s para álbuns, 2s para posts individuais
-            delay = 2.5 if len(group) > 1 else 2
-            await asyncio.sleep(delay)
-
-        # Atualiza last_post_id no final
-        if max_group_id > (channel.last_post_id or 0):
-            channel.last_post_id = max_group_id
+        if result:
+            group_max_id = max(m.id for m in group)
+            if group_max_id > (channel.last_post_id or 0):
+                channel.last_post_id = group_max_id
+            channel.total_forwarded = (channel.total_forwarded or 0) + 1
             db.commit()
 
-        if processed > 0:
-            albums_count = sum(1 for g in msg_groups if len(g) > 1)
+            is_album = len(group) > 1
             create_log(db, channel.user_id, "posts_sent", {
                 "channel_id": channel.id,
                 "origin": str(channel.origin_channel_id),
                 "dest": str(channel.dest_channel_id),
                 "mode": channel.channel_type,
-                "count": processed,
-                "albums_detected": albums_count
+                "count": 1,
+                "is_album": is_album,
+                "remaining": len(msg_groups) - 1
             })
+            return 1
 
-        return processed
+        return 0
 
     except Exception as e:
         logger.error(f"Erro ao processar canal {channel.id}: {e}")

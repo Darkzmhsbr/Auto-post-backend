@@ -619,6 +619,21 @@ def delete_queue_item(item_id: int, user_id: str = Depends(get_current_user), db
     db.commit()
     return {"message": "Item removido da fila!"}
 
+@app.delete("/api/autopost/queue")
+def clear_queue(user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Limpa toda a fila do usuário"""
+    user_channel_ids = [
+        ch.id for ch in
+        db.query(AutopostChannel).filter(AutopostChannel.user_id == user_id).all()
+    ]
+    if user_channel_ids:
+        deleted = db.query(AutopostQueue).filter(
+            AutopostQueue.channel_pair_id.in_(user_channel_ids)
+        ).delete(synchronize_session=False)
+        db.commit()
+        return {"message": f"{deleted} itens removidos da fila!"}
+    return {"message": "Nenhum item para limpar."}
+
 # ==========================================
 # 7. ROTAS DE LOGS / HISTÓRICO
 # ==========================================
