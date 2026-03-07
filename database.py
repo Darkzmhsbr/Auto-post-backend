@@ -10,7 +10,7 @@ BRAZIL_TZ = timezone('America/Sao_Paulo')
 def now_brazil():
     return datetime.now(BRAZIL_TZ)
 
-# Conexão com o Banco de Dados (Puxa a URL do Railway)
+# Conexão com o Banco de Dados
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -24,36 +24,36 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # ==========================================
-# TABELAS DO SISTEMA AUTOPOST (Conforme PDF)
+# TABELAS DO SISTEMA AUTOPOST (V2 - Aceita String)
 # ==========================================
 
 class AutopostSession(Base):
-    __tablename__ = "autopost_sessions"
+    __tablename__ = "autopost_sessions_v2" # Nome novo
     
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=False, index=True) # ID do usuário da plataforma principal
+    user_id = Column(String, nullable=False, index=True) # Mudou de Integer para String!
     phone_number = Column(String(20))
     api_id = Column(String)
     api_hash = Column(String)
-    session_data = Column(BYTEA, nullable=True) # Sessão do Telethon criptografada
+    session_data = Column(BYTEA, nullable=True) 
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=now_brazil)
 
     channels = relationship("AutopostChannel", back_populates="session", cascade="all, delete-orphan")
 
 class AutopostChannel(Base):
-    __tablename__ = "autopost_channels"
+    __tablename__ = "autopost_channels_v2" # Nome novo
     
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=False)
-    session_id = Column(Integer, ForeignKey("autopost_sessions.id"))
+    user_id = Column(String, nullable=False) # Mudou para String
+    session_id = Column(Integer, ForeignKey("autopost_sessions_v2.id"))
     
     bot_token = Column(String, nullable=True)
     origin_channel_id = Column(BigInteger)
     origin_channel_name = Column(String)
     dest_channel_id = Column(BigInteger)
     dest_channel_name = Column(String)
-    channel_type = Column(String) # 'previas' ou 'vip'
+    channel_type = Column(String) 
     
     interval_minutes = Column(Integer, default=30)
     schedule_start = Column(Time, nullable=True)
@@ -61,7 +61,7 @@ class AutopostChannel(Base):
     
     cta_find = Column(Text, nullable=True)
     cta_replace = Column(Text, nullable=True)
-    post_order = Column(String, default="fifo") # 'fifo' ou 'random'
+    post_order = Column(String, default="fifo") 
     
     is_active = Column(Boolean, default=True)
     last_post_id = Column(Integer, default=0)
@@ -72,16 +72,16 @@ class AutopostChannel(Base):
     queue = relationship("AutopostQueue", back_populates="channel_pair", cascade="all, delete-orphan")
 
 class AutopostQueue(Base):
-    __tablename__ = "autopost_queue"
+    __tablename__ = "autopost_queue_v2" # Nome novo
     
     id = Column(Integer, primary_key=True, index=True)
-    channel_pair_id = Column(Integer, ForeignKey("autopost_channels.id"))
+    channel_pair_id = Column(Integer, ForeignKey("autopost_channels_v2.id"))
     
     origin_msg_id = Column(Integer)
-    media_type = Column(String) # 'text', 'photo', 'video', 'album'
-    content_json = Column(JSONB) # Conteúdo extraído da mensagem
+    media_type = Column(String) 
+    content_json = Column(JSONB) 
     
-    status = Column(String, default="pending") # 'pending', 'sent', 'failed', 'skipped'
+    status = Column(String, default="pending") 
     scheduled_for = Column(DateTime, nullable=True)
     sent_at = Column(DateTime, nullable=True)
     error_msg = Column(Text, nullable=True)
@@ -89,11 +89,11 @@ class AutopostQueue(Base):
     channel_pair = relationship("AutopostChannel", back_populates="queue")
 
 class AutopostLog(Base):
-    __tablename__ = "autopost_logs"
+    __tablename__ = "autopost_logs_v2" # Nome novo
     
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=False)
-    action = Column(String) # 'forward', 'skip', 'error', 'config_change'
+    user_id = Column(String, nullable=False) # Mudou para String
+    action = Column(String) 
     details = Column(JSONB, nullable=True)
     created_at = Column(DateTime, default=now_brazil)
 

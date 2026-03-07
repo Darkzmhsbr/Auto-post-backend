@@ -8,14 +8,11 @@ from typing import List, Optional
 from datetime import time
 from jose import jwt, JWTError
 
-# Importações do nosso banco de dados
 from database import init_db, SessionLocal, AutopostChannel, AutopostSession
 
-# 1. INICIALIZAÇÃO
 init_db()
 app = FastAPI(title="Zenyx AutoPost API", version="1.0")
 
-# 2. CONFIGURAÇÃO CORS (Permite o Frontend conversar com este Backend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "https://autopost.zenyxvips.com"],
@@ -24,31 +21,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==========================================
-# 3. SISTEMA DE AUTENTICAÇÃO (O "SSO")
-# ==========================================
 security = HTTPBearer()
 SECRET_KEY = os.getenv("SECRET_KEY", "chave-secreta-padrao") 
 ALGORITHM = "HS256"
 
-# Função que extrai o usuário do Token do Zenyx VIPs
+# ==========================================
+# CÉREBRO DA AUTENTICAÇÃO (Corrigido para aceitar Textos/Emails)
+# ==========================================
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
     try:
-        # Tenta descriptografar o token usando a mesma chave da plataforma principal
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_aud": False})
         
-        # Extrai o ID do usuário (geralmente vem no 'sub' ou 'user_id')
-        user_id = payload.get("sub") or payload.get("user_id") or payload.get("id")
+        # Pega a informação que estiver no token (seja email, username ou ID)
+        user_id = payload.get("sub") or payload.get("id") or payload.get("user_id")
         
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Token inválido: ID não encontrado")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Token inválido: Usuário não encontrado")
             
-        return int(user_id)
+        return str(user_id) # <-- A MÁGICA AQUI: Retorna sempre como Texto Seguro!
     except JWTError:
-        raise HTTPException(status_code=401, detail="Token expirado ou inválido. Faça login novamente.")
+        raise HTTPException(status_code=401, detail="Token expirado ou inválido.")
 
-# Função para conectar no banco em cada requisição
 def get_db():
     db = SessionLocal()
     try:
@@ -56,9 +50,6 @@ def get_db():
     finally:
         db.close()
 
-# ==========================================
-# 4. MODELOS DE DADOS (Pydantic - Validação)
-# ==========================================
 class ChannelCreate(BaseModel):
     origin_channel_id: int
     origin_channel_name: str
@@ -78,29 +69,23 @@ class ChannelResponse(ChannelCreate):
         from_attributes = True
 
 # ==========================================
-# 5. ROTAS DA API (Endpoints)
+# ROTAS
 # ==========================================
-
 @app.get("/")
 def read_root():
     return {"status": "online", "message": "Zenyx AutoPost Backend operando com sucesso!"}
 
 @app.get("/api/auth/me")
-def verify_auth(user_id: int = Depends(get_current_user)):
-    """Rota para o Frontend testar se o login do usuário é válido aqui no AutoPost"""
-    return {"status": "success", "user_id": user_id, "message": "Autenticação via Zenyx VIPs confirmada!"}
-
-# --- ROTAS DE CANAIS ---
+def verify_auth(user_id: str = Depends(get_current_user)): # Mudou para str
+    return {"status": "success", "user_id": user_id, "message": "Autenticação confirmada!"}
 
 @app.get("/api/autopost/channels", response_model=List[ChannelResponse])
-def list_channels(user_id: int = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Lista todos os pares de canais configurados pelo usuário"""
+def list_channels(user_id: str = Depends(get_current_user), db: Session = Depends(get_db)): # Mudou para str
     canais = db.query(AutopostChannel).filter(AutopostChannel.user_id == user_id).all()
     return canais
 
 @app.post("/api/autopost/channels", response_model=ChannelResponse)
-def create_channel(canal: ChannelCreate, user_id: int = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Cria uma nova regra de postagem (Origem -> Destino)"""
+def create_channel(canal: ChannelCreate, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
     novo_canal = AutopostChannel(
         user_id=user_id,
         origin_channel_id=canal.origin_channel_id,
@@ -118,36 +103,32 @@ def create_channel(canal: ChannelCreate, user_id: int = Depends(get_current_user
     return novo_canal
 
 @app.delete("/api/autopost/channels/{channel_id}")
-def delete_channel(channel_id: int, user_id: int = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Deleta um par de canais"""
+def delete_channel(channel_id: int, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
     canal = db.query(AutopostChannel).filter(AutopostChannel.id == channel_id, AutopostChannel.user_id == user_id).first()
     if not canal:
-        raise HTTPException(status_code=404, detail="Configuração de canal não encontrada.")
+        raise HTTPException(status_code=404, detail="Configuração não encontrada.")
     
     db.delete(canal)
     db.commit()
     return {"message": "Canal removido com sucesso!"}
 
 @app.post("/api/autopost/channels/{channel_id}/toggle")
-def toggle_channel(channel_id: int, user_id: int = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Pausa ou Continua as postagens de um canal específico"""
+def toggle_channel(channel_id: int, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
     canal = db.query(AutopostChannel).filter(AutopostChannel.id == channel_id, AutopostChannel.user_id == user_id).first()
     if not canal:
-        raise HTTPException(status_code=404, detail="Configuração de canal não encontrada.")
+        raise HTTPException(status_code=404, detail="Configuração não encontrada.")
     
     canal.is_active = not canal.is_active
     db.commit()
     return {"message": f"Canal {'ativado' if canal.is_active else 'pausado'} com sucesso!", "is_active": canal.is_active}
 
-# --- ROTA DE STATUS GERAL ---
 @app.get("/api/autopost/stats")
-def get_stats(user_id: int = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Retorna dados para o Dashboard"""
+def get_stats(user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
     total_canais = db.query(AutopostChannel).filter(AutopostChannel.user_id == user_id).count()
     canais_ativos = db.query(AutopostChannel).filter(AutopostChannel.user_id == user_id, AutopostChannel.is_active == True).count()
     
     return {
         "total_canais_configurados": total_canais,
         "canais_ativos": canais_ativos,
-        "status_sessao": "pendente" # Atualizaremos isso quando integrarmos o Telethon
+        "status_sessao": "pendente"
     }
