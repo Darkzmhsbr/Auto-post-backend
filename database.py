@@ -52,12 +52,16 @@ class AutopostBot(Base):
     
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=now_brazil)
+    
+    # Relacionamento: um bot pode ter vários canais vinculados
+    channels = relationship("AutopostChannel", back_populates="bot", foreign_keys="AutopostChannel.bot_id")
 
 class AutopostChannel(Base):
     __tablename__ = "autopost_channels_v2" 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String, nullable=False) 
     session_id = Column(Integer, ForeignKey("autopost_sessions_v2.id"))
+    bot_id = Column(Integer, ForeignKey("autopost_bots.id"), nullable=True)  # 👈 NOVO: Vincula ao bot da ponte
     bot_token = Column(String, nullable=True)
     origin_channel_id = Column(BigInteger)
     origin_channel_name = Column(String)
@@ -75,6 +79,7 @@ class AutopostChannel(Base):
     total_forwarded = Column(Integer, default=0)
     created_at = Column(DateTime, default=now_brazil)
     session = relationship("AutopostSession", back_populates="channels")
+    bot = relationship("AutopostBot", back_populates="channels", foreign_keys=[bot_id])  # 👈 NOVO
     queue = relationship("AutopostQueue", back_populates="channel_pair", cascade="all, delete-orphan")
 
 class AutopostQueue(Base):

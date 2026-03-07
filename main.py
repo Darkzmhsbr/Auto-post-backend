@@ -13,7 +13,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
-from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot
+from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, engine, Base
 
 init_db()
 app = FastAPI(title="Zenyx AutoPost API", version="1.0")
@@ -81,19 +81,37 @@ class BotResponse(BaseModel):
     class Config:
         from_attributes = True
 
-# 👇 Estes foram os que eu havia esquecido na última versão! 👇
+# 👇 Modelos de Canais (atualizados com bot_id e campos de agendamento) 👇
 class ChannelCreate(BaseModel):
+    bot_id: Optional[int] = None
     origin_channel_id: int
     origin_channel_name: str
     dest_channel_id: int
     dest_channel_name: str
     channel_type: str
     interval_minutes: int
+    schedule_start: Optional[str] = None  # Formato "HH:MM"
+    schedule_end: Optional[str] = None    # Formato "HH:MM"
+    post_order: Optional[str] = "fifo"
     cta_find: Optional[str] = None
     cta_replace: Optional[str] = None
 
-class ChannelResponse(ChannelCreate):
+class ChannelResponse(BaseModel):
     id: int
+    bot_id: Optional[int] = None
+    bot_name: Optional[str] = None      # 👈 Nome do bot vinculado (preenchido na rota)
+    bot_username: Optional[str] = None  # 👈 @username do bot vinculado
+    origin_channel_id: int
+    origin_channel_name: str
+    dest_channel_id: int
+    dest_channel_name: str
+    channel_type: str
+    interval_minutes: int
+    schedule_start: Optional[str] = None
+    schedule_end: Optional[str] = None
+    post_order: Optional[str] = "fifo"
+    cta_find: Optional[str] = None
+    cta_replace: Optional[str] = None
     is_active: bool
     total_forwarded: int
 
@@ -216,27 +234,81 @@ def delete_bot(bot_id: int, user_id: str = Depends(get_current_user), db: Sessio
 # ==========================================
 # 3. ROTAS DE CANAIS (CLONAGEM/AUTOPOST)
 # ==========================================
-@app.get("/api/autopost/channels", response_model=List[ChannelResponse])
-def list_channels(user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
-    return db.query(AutopostChannel).filter(AutopostChannel.user_id == user_id).all()
 
-@app.post("/api/autopost/channels", response_model=ChannelResponse)
+# Helper para serializar canal com dados do bot
+def _serialize_channel(canal, db):
+    """Converte AutopostChannel em dict com bot_name e bot_username"""
+    data = {
+        "id": canal.id,
+        "bot_id": canal.bot_id,
+        "bot_name": None,
+        "bot_username": None,
+        "origin_channel_id": canal.origin_channel_id,
+        "origin_channel_name": canal.origin_channel_name,
+        "dest_channel_id": canal.dest_channel_id,
+        "dest_channel_name": canal.dest_channel_name,
+        "channel_type": canal.channel_type,
+        "interval_minutes": canal.interval_minutes,
+        "schedule_start": canal.schedule_start.strftime("%H:%M") if canal.schedule_start else None,
+        "schedule_end": canal.schedule_end.strftime("%H:%M") if canal.schedule_end else None,
+        "post_order": canal.post_order or "fifo",
+        "cta_find": canal.cta_find,
+        "cta_replace": canal.cta_replace,
+        "is_active": canal.is_active,
+        "total_forwarded": canal.total_forwarded or 0,
+    }
+    # Puxa nome do bot se vinculado
+    if canal.bot_id:
+        bot = db.query(AutopostBot).filter(AutopostBot.id == canal.bot_id).first()
+        if bot:
+            data["bot_name"] = bot.bot_name
+            data["bot_username"] = bot.bot_username
+    return data
+
+@app.get("/api/autopost/channels")
+def list_channels(user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    canais = db.query(AutopostChannel).filter(AutopostChannel.user_id == user_id).all()
+    return [_serialize_channel(c, db) for c in canais]
+
+@app.post("/api/autopost/channels")
 def create_channel(canal: ChannelCreate, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    from datetime import time as dt_time
+    
+    # Converte strings "HH:MM" para objetos Time
+    start_time = None
+    end_time = None
+    if canal.schedule_start:
+        parts = canal.schedule_start.split(":")
+        start_time = dt_time(int(parts[0]), int(parts[1]))
+    if canal.schedule_end:
+        parts = canal.schedule_end.split(":")
+        end_time = dt_time(int(parts[0]), int(parts[1]))
+    
+    # Se bot_id fornecido, valida se pertence ao usuário
+    if canal.bot_id:
+        bot = db.query(AutopostBot).filter(AutopostBot.id == canal.bot_id, AutopostBot.user_id == user_id).first()
+        if not bot:
+            raise HTTPException(status_code=400, detail="Bot não encontrado ou não pertence a você.")
+    
     novo_canal = AutopostChannel(
         user_id=user_id,
+        bot_id=canal.bot_id,
         origin_channel_id=canal.origin_channel_id,
         origin_channel_name=canal.origin_channel_name,
         dest_channel_id=canal.dest_channel_id,
         dest_channel_name=canal.dest_channel_name,
         channel_type=canal.channel_type,
         interval_minutes=canal.interval_minutes,
+        schedule_start=start_time,
+        schedule_end=end_time,
+        post_order=canal.post_order or "fifo",
         cta_find=canal.cta_find,
         cta_replace=canal.cta_replace
     )
     db.add(novo_canal)
     db.commit()
     db.refresh(novo_canal)
-    return novo_canal
+    return _serialize_channel(novo_canal, db)
 
 @app.delete("/api/autopost/channels/{channel_id}")
 def delete_channel(channel_id: int, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -271,6 +343,7 @@ def verify_auth(user_id: str = Depends(get_current_user)):
 def get_stats(user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
     total_canais = db.query(AutopostChannel).filter(AutopostChannel.user_id == user_id).count()
     canais_ativos = db.query(AutopostChannel).filter(AutopostChannel.user_id == user_id, AutopostChannel.is_active == True).count()
+    total_bots = db.query(AutopostBot).filter(AutopostBot.user_id == user_id).count()
     
     session = db.query(AutopostSession).filter(AutopostSession.user_id == user_id).first()
     status_sessao = "ativa" if (session and session.is_active and session.session_data) else "desconectada"
@@ -278,5 +351,49 @@ def get_stats(user_id: str = Depends(get_current_user), db: Session = Depends(ge
     return {
         "total_canais_configurados": total_canais,
         "canais_ativos": canais_ativos,
+        "total_bots": total_bots,
         "status_sessao": status_sessao
     }
+
+# ==========================================
+# 5. ROTA DE MIGRAÇÃO (Acessar via URL para aplicar novas colunas)
+# ==========================================
+@app.get("/api/migrate")
+def run_migration(db: Session = Depends(get_db)):
+    """
+    Rota de migração manual. Acesse:
+    https://api-autopost.zenyxvips.com/api/migrate
+    
+    Adiciona a coluna bot_id na tabela autopost_channels_v2
+    (e cria a tabela autopost_bots se não existir).
+    """
+    from sqlalchemy import text, inspect
+    
+    results = []
+    
+    try:
+        inspector = inspect(engine)
+        existing_tables = inspector.get_table_names()
+        
+        # 1. Cria tabela autopost_bots se não existir
+        if "autopost_bots" not in existing_tables:
+            Base.metadata.tables["autopost_bots"].create(bind=engine)
+            results.append("✅ Tabela 'autopost_bots' criada com sucesso!")
+        else:
+            results.append("ℹ️ Tabela 'autopost_bots' já existe.")
+        
+        # 2. Adiciona coluna bot_id em autopost_channels_v2 se não existir
+        columns = [col["name"] for col in inspector.get_columns("autopost_channels_v2")]
+        
+        if "bot_id" not in columns:
+            db.execute(text("ALTER TABLE autopost_channels_v2 ADD COLUMN bot_id INTEGER REFERENCES autopost_bots(id)"))
+            db.commit()
+            results.append("✅ Coluna 'bot_id' adicionada em 'autopost_channels_v2'!")
+        else:
+            results.append("ℹ️ Coluna 'bot_id' já existe em 'autopost_channels_v2'.")
+        
+        return {"status": "success", "migrations": results}
+    
+    except Exception as e:
+        db.rollback()
+        return {"status": "error", "detail": str(e), "migrations": results}
