@@ -668,6 +668,7 @@ def clear_logs(user_id: str = Depends(get_current_user), db: Session = Depends(g
     db.query(AutopostLog).filter(AutopostLog.user_id == user_id).delete()
     db.commit()
     return {"message": "Histórico limpo com sucesso!"}
+    
 
 # ==========================================
 # 8. ROTA DE MIGRAÇÃO (Acessar via URL para aplicar novas colunas)
