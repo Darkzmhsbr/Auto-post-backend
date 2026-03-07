@@ -19,8 +19,14 @@ from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument,
     MessageMediaWebPage, MessageMediaContact
 )
-from telethon.tl.functions.channels import GetForumTopicsRequest, CreateForumTopicRequest
 from telethon.extensions import html  
+
+# 👇 ESCUDO DE PROTEÇÃO PARA VERSÕES ANTIGAS DO TELETHON 👇
+try:
+    from telethon.tl.functions.channels import GetForumTopicsRequest, CreateForumTopicRequest
+    TOPICS_SUPPORTED = True
+except ImportError:
+    TOPICS_SUPPORTED = False
 
 from database import SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination, AutopostTopicMap
 
@@ -64,11 +70,6 @@ def is_within_schedule(channel):
 def apply_cta_replacement(text, cta_find, cta_replace, cta_mode="exact"):
     """
     Substitui o CTA/link no texto da mensagem.
-    
-    Modos:
-    - "exact": Busca exata (substitui apenas o texto idêntico ao cta_find)
-    - "smart": Detecta TODOS os links t.me/ (tanto em texto plano quanto em tags <a href>)
-               e substitui pelo cta_replace, preservando a formatação HTML.
     """
     if not text or not cta_replace:
         return text
@@ -76,23 +77,17 @@ def apply_cta_replacement(text, cta_find, cta_replace, cta_mode="exact"):
     if cta_mode == "smart":
         import re
         
-        # 1. Substitui links dentro de tags <a href="..."> (preserva a tag, troca só a URL)
         def replace_href(match):
             return f'<a href="{cta_replace}">'
         text = re.sub(r'<a\s+href="https?://t\.me/[^"]*">', replace_href, text)
         text = re.sub(r'<a\s+href="https?://telegram\.me/[^"]*">', replace_href, text)
         
-        # 2. Substitui links t.me em texto plano (que NÃO estejam dentro de um href="...")
-        # Usa negative lookbehind para não pegar os que já estão dentro de href=""
         text = re.sub(r'(?<!href=")(?<!href=\')https?://t\.me/\S+', cta_replace, text)
         text = re.sub(r'(?<!href=")(?<!href=\')https?://telegram\.me/\S+', cta_replace, text)
-        
-        # 3. Links sem http (t.me/Bot) em texto plano
         text = re.sub(r'(?<!["/])(?<!\w)t\.me/\S+', cta_replace, text)
         
         return text
     else:
-        # Modo exato (legado)
         if not cta_find:
             return text
         return text.replace(cta_find, cta_replace)
@@ -104,29 +99,22 @@ def apply_custom_caption(original_text, channel):
         return original_text
     
     if channel.caption_mode == 'append':
-        # Adiciona a legenda personalizada abaixo da original
         separator = "\n\n" if original_text else ""
         return (original_text or '') + separator + channel.custom_caption
     else:
-        # Substitui completamente a legenda original
         return channel.custom_caption
 
 
 def get_all_dest_channel_ids(channel, db):
-    """
-    Retorna lista de todos os IDs de destino (principal + extras).
-    Cada item é dict: {id, dest_channel_id, dest_channel_name}
-    """
+    """Retorna lista de todos os IDs de destino (principal + extras)."""
     destinations = []
     
-    # Destino principal (legado)
     if channel.dest_channel_id:
         destinations.append({
             "dest_channel_id": int(channel.dest_channel_id),
             "dest_channel_name": channel.dest_channel_name or "Principal",
         })
     
-    # Destinos adicionais
     extras = db.query(AutopostDestination).filter(
         AutopostDestination.channel_id == channel.id,
         AutopostDestination.is_active == True
@@ -164,13 +152,8 @@ def create_queue_entry(db, channel_pair_id, origin_msg_id, media_type, content_j
 
 
 def group_messages_by_album(messages):
-    """
-    Agrupa mensagens por grouped_id (álbuns).
-    Mensagens sem grouped_id ficam como grupo individual.
-    Retorna lista de listas: [[msg], [msg1, msg2, msg3], [msg], ...]
-    Mantém a ordem original (baseada no primeiro msg de cada grupo).
-    """
-    groups = OrderedDict()  # chave -> [messages]
+    """Agrupa mensagens por grouped_id (álbuns)."""
+    groups = OrderedDict() 
 
     for msg in messages:
         gid = getattr(msg, 'grouped_id', None)
@@ -179,7 +162,6 @@ def group_messages_by_album(messages):
                 groups[gid] = []
             groups[gid].append(msg)
         else:
-            # Mensagem individual: usa chave única
             groups[f"single_{msg.id}"] = [msg]
 
     return list(groups.values())
@@ -191,8 +173,11 @@ def group_messages_by_album(messages):
 
 async def get_or_create_topic(client, chat_id, topic_name):
     """Busca um tópico pelo nome no destino. Se não existir, cria automaticamente."""
+    if not TOPICS_SUPPORTED:
+        logger.warning(f"Espelhamento ignorado: Telethon antigo. Atualize para >=1.36.0 para criar '{topic_name}'")
+        return None
+
     try:
-        # 1. Tenta encontrar o tópico existente
         topics = await client(GetForumTopicsRequest(
             channel=chat_id,
             q=topic_name,
@@ -205,10 +190,8 @@ async def get_or_create_topic(client, chat_id, topic_name):
             if getattr(t, 'title', '') == topic_name:
                 return t.id
     except Exception as e:
-        # Falha silenciosamente (o destino pode não ser um fórum)
         pass
 
-    # 2. Se não encontrou, cria o tópico
     try:
         result = await client(CreateForumTopicRequest(
             channel=chat_id,
@@ -224,15 +207,10 @@ async def get_or_create_topic(client, chat_id, topic_name):
     return None
 
 async def resolve_dest_topics(userbot, dest_client, channel, first_msg, all_destinations, db):
-    """
-    Descobre se a postagem veio de um tópico na origem.
-    Se sim, verifica o banco (mapa manual) ou cria automaticamente (Espelhamento Inteligente).
-    Retorna dict: { dest_channel_id: dest_topic_id }
-    """
+    """Descobre se a postagem veio de um tópico na origem e resolve o destino."""
     dest_topic_ids = {}
     origin_topic_id = None
     
-    # Verifica se a mensagem original veio de um fórum/tópico
     if first_msg.reply_to and getattr(first_msg.reply_to, 'forum_topic', False):
         origin_topic_id = getattr(first_msg.reply_to, 'reply_to_top_id', None) or getattr(first_msg.reply_to, 'reply_to_msg_id', None)
     
@@ -242,7 +220,6 @@ async def resolve_dest_topics(userbot, dest_client, channel, first_msg, all_dest
         for dest in all_destinations:
             dest_id = dest["dest_channel_id"]
             
-            # 1. Prioridade: Verifica se existe mapeamento manual
             mapped = db.query(AutopostTopicMap).filter(
                 AutopostTopicMap.channel_id == channel.id,
                 AutopostTopicMap.origin_topic_id == origin_topic_id
@@ -251,10 +228,7 @@ async def resolve_dest_topics(userbot, dest_client, channel, first_msg, all_dest
             if mapped and mapped.dest_topic_id:
                 dest_topic_ids[dest_id] = int(mapped.dest_topic_id)
                 
-            # 2. Se não tem mapa e o Espelhamento Automático está LIGADO
             elif getattr(channel, 'auto_topic_clone', False):
-                
-                # Obtém o nome do tópico na origem (apenas 1x por tick)
                 if topic_name is None:
                     topic_name = f"Tópico {origin_topic_id}"
                     try:
@@ -264,13 +238,10 @@ async def resolve_dest_topics(userbot, dest_client, channel, first_msg, all_dest
                     except Exception as e:
                         logger.error(f"Erro ao ler nome do tópico na origem: {e}")
                         
-                # Resolve no destino (Busca ou Cria)
                 d_topic_id = await get_or_create_topic(dest_client, dest_id, topic_name)
                 
                 if d_topic_id:
                     dest_topic_ids[dest_id] = d_topic_id
-                    
-                    # Salva no banco para funcionar como cache na próxima vez
                     if not mapped:
                         try:
                             new_map = AutopostTopicMap(
@@ -354,7 +325,6 @@ async def get_bot_client(bot_token):
 
 
 def _get_bot_record(channel, db):
-    """Helper: retorna bot_record se houver bot vinculado"""
     if channel.bot_id:
         return db.query(AutopostBot).filter(AutopostBot.id == channel.bot_id).first()
     return None
@@ -365,10 +335,6 @@ def _get_bot_record(channel, db):
 # ==========================================
 
 async def process_clone(userbot, channel, msg_group, db):
-    """
-    MODO CLONE: Copia texto/mídia e reposta como novo.
-    Suporta álbuns, múltiplos destinos, tópicos e legenda personalizada.
-    """
     dest_client = userbot
     bot_record = _get_bot_record(channel, db)
 
@@ -388,7 +354,6 @@ async def process_clone(userbot, channel, msg_group, db):
         logger.warning(f"CLONE | Canal {channel.id} sem destinos configurados.")
         return None
 
-    # 👇 RESOLUÇÃO INTELIGENTE DE TÓPICOS
     dest_topic_ids = await resolve_dest_topics(userbot, dest_client, channel, first_msg, all_destinations, db)
     downloaded_paths = []
 
@@ -514,9 +479,6 @@ async def process_clone(userbot, channel, msg_group, db):
                     pass
 
 async def process_forward(userbot, channel, msg_group, db):
-    """
-    MODO FORWARD: Encaminha nativamente para múltiplos destinos (com suporte a tópicos).
-    """
     dest_client = userbot
     bot_record = _get_bot_record(channel, db)
 
@@ -534,7 +496,6 @@ async def process_forward(userbot, channel, msg_group, db):
         logger.warning(f"FORWARD | Canal {channel.id} sem destinos configurados.")
         return None
 
-    # 👇 RESOLUÇÃO INTELIGENTE DE TÓPICOS
     dest_topic_ids = await resolve_dest_topics(userbot, dest_client, channel, first_msg, all_destinations, db)
 
     try:
@@ -575,9 +536,6 @@ async def process_forward(userbot, channel, msg_group, db):
 
 
 async def process_spy(userbot, channel, msg_group, db):
-    """
-    MODO ESPIONAR (PONTE PREMIUM) com espelhamento de tópicos.
-    """
     if not channel.bot_id:
         logger.warning(f"SPY | Canal {channel.id} sem bot vinculado. Fazendo clone direto.")
         return await process_clone(userbot, channel, msg_group, db)
@@ -599,8 +557,6 @@ async def process_spy(userbot, channel, msg_group, db):
     if not all_destinations:
         all_destinations = [{"dest_channel_id": int(bot_record.dest_channel_id), "dest_channel_name": "Bot Destino"}]
 
-    # 👇 RESOLUÇÃO INTELIGENTE DE TÓPICOS
-    # Nota: Aqui o dest_client repassado é o bot_client (que fará a postagem final)
     dest_topic_ids = await resolve_dest_topics(userbot, bot_client, channel, first_msg, all_destinations, db)
     downloaded_paths = []
 
@@ -634,7 +590,6 @@ async def process_spy(userbot, channel, msg_group, db):
             if not media_files:
                 return None
 
-            # PASSO 1: Userbot envia álbum pro Canal Oculto
             bridge_msgs = await userbot.send_file(bridge_channel_id, file=media_files, caption=album_caption if album_caption else None, parse_mode='html')
             await asyncio.sleep(1.5)
 
@@ -643,7 +598,6 @@ async def process_spy(userbot, channel, msg_group, db):
             else:
                 bridge_msg_ids = [bridge_msgs.id]
 
-            # PASSO 2: Bot encaminha para TODOS os destinos (com suporte a tópicos)
             for dest in all_destinations:
                 reply_to_id = dest_topic_ids.get(dest["dest_channel_id"])
                 try:
@@ -733,17 +687,9 @@ async def process_spy(userbot, channel, msg_group, db):
 # PROCESSADOR PRINCIPAL DE UM CANAL
 # ==========================================
 async def process_channel(channel, session_record, db):
-    """
-    Processa um canal ativo: lê mensagens novas, agrupa álbuns, e despacha.
-    
-    RESPEITA interval_minutes: só envia 1 post/álbum por vez.
-    O engine roda a cada 30s, mas só envia se o tempo desde o último envio >= interval_minutes.
-    """
-
     if not is_within_schedule(channel):
         return 0
 
-    # Verifica se já passou o intervalo desde o último envio
     last_sent = db.query(AutopostQueue).filter(
         AutopostQueue.channel_pair_id == channel.id,
         AutopostQueue.status == "sent"
@@ -752,7 +698,6 @@ async def process_channel(channel, session_record, db):
     if last_sent and last_sent.sent_at:
         last_dt = last_sent.sent_at
         
-        # 👇 Correção definitiva do fuso horário para garantir que o intervalo avance
         if last_dt.tzinfo is None:
             elapsed_local = (now_brazil().replace(tzinfo=None) - last_dt).total_seconds()
             elapsed_utc = (datetime.utcnow() - last_dt).total_seconds()
@@ -770,7 +715,7 @@ async def process_channel(channel, session_record, db):
 
         interval_seconds = (channel.interval_minutes or 5) * 60
         if elapsed < interval_seconds:
-            return 0  # Ainda não deu tempo, espera o próximo tick
+            return 0
 
     userbot = await get_userbot_client(session_record)
     if not userbot:
@@ -810,7 +755,6 @@ async def process_channel(channel, session_record, db):
         if not msg_groups:
             return 0
 
-        # ===== PEGA APENAS O PRÓXIMO GRUPO (1 post ou 1 álbum por tick) =====
         group = msg_groups[0]
 
         if channel.channel_type == 'forward':
@@ -820,7 +764,6 @@ async def process_channel(channel, session_record, db):
         else:
             result = await process_clone(userbot, channel, group, db)
 
-        # 👇 Sempre avançamos o ID do canal para evitar loop
         group_max_id = max(m.id for m in group)
         if group_max_id > (channel.last_post_id or 0):
             channel.last_post_id = group_max_id
@@ -857,7 +800,6 @@ async def process_channel(channel, session_record, db):
 # LOOP PRINCIPAL DO ENGINE
 # ==========================================
 async def engine_tick():
-    """Executado a cada ciclo pelo APScheduler."""
     db = SessionLocal()
 
     try:
@@ -907,17 +849,14 @@ async def engine_tick():
 
 
 def run_engine_tick():
-    """Wrapper síncrono para o APScheduler chamar a função async no loop correto"""
     global _main_loop
     
     if _main_loop is None or _main_loop.is_closed():
         logger.warning("Event loop principal não disponível. Pulando tick.")
         return
     
-    # Executa no loop do uvicorn (mesmo loop onde Telethon conectou)
     future = asyncio.run_coroutine_threadsafe(engine_tick(), _main_loop)
     try:
-        # Aguarda até 25 segundos (antes do próximo tick de 30s)
         future.result(timeout=25)
     except Exception as e:
         logger.error(f"Erro no engine tick: {e}")
@@ -927,14 +866,12 @@ def run_engine_tick():
 # STARTUP / SHUTDOWN
 # ==========================================
 _scheduler = None
-_main_loop = None  # Referência ao event loop do uvicorn
+_main_loop = None
 
 
 def start_engine():
-    """Inicia o APScheduler com o engine_tick rodando a cada 60 segundos"""
     global _scheduler, _main_loop
 
-    # Captura o event loop do uvicorn/FastAPI
     try:
         _main_loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -956,11 +893,10 @@ def start_engine():
         coalesce=True
     )
     _scheduler.start()
-    logger.info("🚀 AutoPost Engine v3 (Multi-Dest + Smart Topics + Custom Caption) iniciado! Tick a cada 30s.")
+    logger.info("🚀 AutoPost Engine v3 iniciado! Tick a cada 30s.")
 
 
 def stop_engine():
-    """Para o APScheduler graciosamente"""
     global _scheduler, _main_loop
 
     if _scheduler:
@@ -979,7 +915,6 @@ def stop_engine():
             except Exception:
                 pass
 
-    # Tenta desconectar no loop principal
     if _main_loop and not _main_loop.is_closed():
         try:
             asyncio.run_coroutine_threadsafe(_disconnect_all(), _main_loop)
@@ -991,11 +926,7 @@ def stop_engine():
     _main_loop = None
 
 
-# ==========================================
-# STATUS DO ENGINE
-# ==========================================
 def get_engine_status():
-    """Retorna status do engine para exibir no frontend"""
     return {
         "running": _scheduler is not None and _scheduler.running if _scheduler else False,
         "userbots_connected": len(_userbot_clients),
