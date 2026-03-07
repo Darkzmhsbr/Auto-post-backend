@@ -4,7 +4,7 @@ sqlalchemy
 psycopg2-binary
 pydantic
 python-jose[cryptography]
-telethon>=1.36.0
+telethon==1.38.1
 apscheduler
 python-dotenv
 pytz
