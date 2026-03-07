@@ -73,6 +73,7 @@ class AutopostChannel(Base):
     schedule_end = Column(Time, nullable=True)
     cta_find = Column(Text, nullable=True)
     cta_replace = Column(Text, nullable=True)
+    cta_mode = Column(String, default="exact")     # "exact" ou "smart" (detecta todos os links)
     post_order = Column(String, default="fifo") 
     # 👇 NOVOS: Legenda personalizada com formatação HTML/Telegram
     custom_caption = Column(Text, nullable=True)       # Legenda HTML personalizada

@@ -60,11 +60,37 @@ def is_within_schedule(channel):
         return now >= start or now <= end
 
 
-def apply_cta_replacement(text, cta_find, cta_replace):
-    """Substitui o CTA/link no texto da mensagem"""
-    if not text or not cta_find:
+def apply_cta_replacement(text, cta_find, cta_replace, cta_mode="exact"):
+    """
+    Substitui o CTA/link no texto da mensagem.
+    
+    Modos:
+    - "exact": Busca exata (substitui apenas o texto idêntico ao cta_find)
+    - "smart": Detecta TODOS os links t.me/...Bot e similares e substitui pelo cta_replace
+    """
+    if not text or not cta_replace:
         return text
-    return text.replace(cta_find, cta_replace or '')
+    
+    if cta_mode == "smart":
+        import re
+        # Detecta links de bots do Telegram: https://t.me/NomeBot?start=xxx
+        # Também pega variações: t.me/Nome01Bot, t.me/Nome02Bot, etc.
+        # E links genéricos com http/https
+        patterns = [
+            r'https?://t\.me/\S+',          # Links t.me completos
+            r't\.me/\S+',                     # Links t.me sem http
+            r'https?://telegram\.me/\S+',     # Links telegram.me
+        ]
+        combined_pattern = '|'.join(patterns)
+        
+        # Substitui TODOS os links encontrados pelo cta_replace
+        result = re.sub(combined_pattern, cta_replace, text)
+        return result
+    else:
+        # Modo exato (legado)
+        if not cta_find:
+            return text
+        return text.replace(cta_find, cta_replace)
 
 
 def apply_custom_caption(original_text, channel):
@@ -281,7 +307,7 @@ async def process_clone(userbot, channel, msg_group, db):
                     msg_text = raw_text
 
                 if msg_text and album_caption is None:
-                    album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace)
+                    album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace, channel.cta_mode)
             
             album_caption = apply_custom_caption(album_caption, channel)
             
@@ -318,7 +344,7 @@ async def process_clone(userbot, channel, msg_group, db):
             else:
                 text = raw_text
 
-            text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace)
+            text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace, channel.cta_mode)
             text = apply_custom_caption(text, channel)
             media_type = "text"
             
@@ -490,7 +516,7 @@ async def process_spy(userbot, channel, msg_group, db):
                     msg_text = raw_text
 
                 if msg_text and album_caption is None:
-                    album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace)
+                    album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace, channel.cta_mode)
             
             album_caption = apply_custom_caption(album_caption, channel)
             if not media_files:
@@ -524,7 +550,7 @@ async def process_spy(userbot, channel, msg_group, db):
             else:
                 text = raw_text
 
-            text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace)
+            text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace, channel.cta_mode)
             text = apply_custom_caption(text, channel)
             
             downloaded_file = None
@@ -563,7 +589,7 @@ async def process_spy(userbot, channel, msg_group, db):
         for m in msg_group:
             t = m.text or m.message or ''
             if t:
-                text_preview = apply_cta_replacement(t, channel.cta_find, channel.cta_replace)[:200]
+                text_preview = apply_cta_replacement(t, channel.cta_find, channel.cta_replace, channel.cta_mode)[:200]
                 break
 
         queue_entry = create_queue_entry(

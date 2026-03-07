@@ -105,12 +105,12 @@ class DestinationResponse(BaseModel):
     class Config:
         from_attributes = True
 
-# 👇 Modelos de Canais (com múltiplos destinos + legenda personalizada) 👇
+# 👇 Modelos de Canais (com múltiplos destinos + legenda personalizada + CTA inteligente) 👇
 class ChannelCreate(BaseModel):
     bot_id: Optional[int] = None
     origin_channel_id: int
     origin_channel_name: str
-    dest_channel_id: int              # Destino principal (legado)
+    dest_channel_id: int
     dest_channel_name: str
     channel_type: str
     interval_minutes: int
@@ -119,12 +119,30 @@ class ChannelCreate(BaseModel):
     post_order: Optional[str] = "fifo"
     cta_find: Optional[str] = None
     cta_replace: Optional[str] = None
-    # Legenda personalizada
+    cta_mode: Optional[str] = "exact"    # "exact" ou "smart"
     custom_caption: Optional[str] = None
     use_custom_caption: Optional[bool] = False
-    caption_mode: Optional[str] = "replace"   # "replace" ou "append"
-    # Destinos adicionais (além do principal)
+    caption_mode: Optional[str] = "replace"
     extra_destinations: Optional[List[DestinationCreate]] = None
+
+# Modelo para edição (todos campos opcionais)
+class ChannelUpdate(BaseModel):
+    bot_id: Optional[int] = None
+    origin_channel_id: Optional[int] = None
+    origin_channel_name: Optional[str] = None
+    dest_channel_id: Optional[int] = None
+    dest_channel_name: Optional[str] = None
+    channel_type: Optional[str] = None
+    interval_minutes: Optional[int] = None
+    schedule_start: Optional[str] = None
+    schedule_end: Optional[str] = None
+    post_order: Optional[str] = None
+    cta_find: Optional[str] = None
+    cta_replace: Optional[str] = None
+    cta_mode: Optional[str] = None
+    custom_caption: Optional[str] = None
+    use_custom_caption: Optional[bool] = None
+    caption_mode: Optional[str] = None
 
 class ChannelResponse(BaseModel):
     id: int
@@ -142,12 +160,13 @@ class ChannelResponse(BaseModel):
     post_order: Optional[str] = "fifo"
     cta_find: Optional[str] = None
     cta_replace: Optional[str] = None
+    cta_mode: Optional[str] = "exact"
     custom_caption: Optional[str] = None
     use_custom_caption: Optional[bool] = False
     caption_mode: Optional[str] = "replace"
     is_active: bool
     total_forwarded: int
-    destinations: Optional[List[DestinationResponse]] = []  # Todos os destinos
+    destinations: Optional[List[DestinationResponse]] = []
 
     class Config:
         from_attributes = True
@@ -288,6 +307,7 @@ def _serialize_channel(canal, db):
         "post_order": canal.post_order or "fifo",
         "cta_find": canal.cta_find,
         "cta_replace": canal.cta_replace,
+        "cta_mode": canal.cta_mode or "exact",
         "custom_caption": canal.custom_caption,
         "use_custom_caption": canal.use_custom_caption or False,
         "caption_mode": canal.caption_mode or "replace",
@@ -347,6 +367,7 @@ def create_channel(canal: ChannelCreate, user_id: str = Depends(get_current_user
         post_order=canal.post_order or "fifo",
         cta_find=canal.cta_find,
         cta_replace=canal.cta_replace,
+        cta_mode=canal.cta_mode or "exact",
         custom_caption=canal.custom_caption,
         use_custom_caption=canal.use_custom_caption or False,
         caption_mode=canal.caption_mode or "replace",
@@ -367,6 +388,50 @@ def create_channel(canal: ChannelCreate, user_id: str = Depends(get_current_user
         db.commit()
     
     return _serialize_channel(novo_canal, db)
+
+# Rota de edição completa de canal
+@app.put("/api/autopost/channels/{channel_id}")
+def update_channel(channel_id: int, data: ChannelUpdate, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Atualiza configuração de um canal existente"""
+    from datetime import time as dt_time
+    
+    canal = db.query(AutopostChannel).filter(AutopostChannel.id == channel_id, AutopostChannel.user_id == user_id).first()
+    if not canal:
+        raise HTTPException(status_code=404, detail="Canal não encontrado.")
+    
+    # Atualiza apenas campos enviados (não None)
+    update_data = data.dict(exclude_unset=True, exclude_none=True)
+    
+    # Tratamento especial para schedule (string HH:MM → time)
+    if "schedule_start" in update_data:
+        val = update_data.pop("schedule_start")
+        if val:
+            parts = val.split(":")
+            canal.schedule_start = dt_time(int(parts[0]), int(parts[1]))
+        else:
+            canal.schedule_start = None
+    
+    if "schedule_end" in update_data:
+        val = update_data.pop("schedule_end")
+        if val:
+            parts = val.split(":")
+            canal.schedule_end = dt_time(int(parts[0]), int(parts[1]))
+        else:
+            canal.schedule_end = None
+    
+    # Permite limpar campos de texto com string vazia
+    for field in ["cta_find", "cta_replace", "custom_caption"]:
+        if field in update_data and update_data[field] == "":
+            update_data[field] = None
+    
+    # Aplica os demais campos
+    for key, value in update_data.items():
+        if hasattr(canal, key):
+            setattr(canal, key, value)
+    
+    db.commit()
+    db.refresh(canal)
+    return _serialize_channel(canal, db)
 
 # CRUD de Destinos individuais (adicionar/remover destinos após criação)
 @app.post("/api/autopost/channels/{channel_id}/destinations")
@@ -627,6 +692,7 @@ def run_migration(db: Session = Depends(get_db)):
             "custom_caption": "TEXT",
             "use_custom_caption": "BOOLEAN DEFAULT FALSE",
             "caption_mode": "VARCHAR DEFAULT 'replace'",
+            "cta_mode": "VARCHAR DEFAULT 'exact'",
         }
         
         for col_name, col_def in new_columns.items():
