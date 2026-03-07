@@ -7,3 +7,4 @@ python-jose[cryptography]
 telethon
 apscheduler
 python-dotenv
+pytz
