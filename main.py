@@ -13,10 +13,20 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
-from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, engine, Base
+from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, engine, Base
+from engine import start_engine, stop_engine, get_engine_status
 
 init_db()
 app = FastAPI(title="Zenyx AutoPost API", version="1.0")
+
+# Inicia e para o Engine junto com o FastAPI
+@app.on_event("startup")
+def on_startup():
+    start_engine()
+
+@app.on_event("shutdown")
+def on_shutdown():
+    stop_engine()
 
 app.add_middleware(
     CORSMiddleware,
@@ -345,18 +355,150 @@ def get_stats(user_id: str = Depends(get_current_user), db: Session = Depends(ge
     canais_ativos = db.query(AutopostChannel).filter(AutopostChannel.user_id == user_id, AutopostChannel.is_active == True).count()
     total_bots = db.query(AutopostBot).filter(AutopostBot.user_id == user_id).count()
     
+    # Conta posts enviados hoje
+    from datetime import datetime, timedelta
+    from pytz import timezone as tz
+    hoje_inicio = datetime.now(tz('America/Sao_Paulo')).replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    user_channel_ids = [
+        ch.id for ch in
+        db.query(AutopostChannel).filter(AutopostChannel.user_id == user_id).all()
+    ]
+    posts_hoje = 0
+    if user_channel_ids:
+        posts_hoje = db.query(AutopostQueue).filter(
+            AutopostQueue.channel_pair_id.in_(user_channel_ids),
+            AutopostQueue.status == "sent",
+            AutopostQueue.sent_at >= hoje_inicio
+        ).count()
+    
     session = db.query(AutopostSession).filter(AutopostSession.user_id == user_id).first()
     status_sessao = "ativa" if (session and session.is_active and session.session_data) else "desconectada"
+    
+    engine_info = get_engine_status()
     
     return {
         "total_canais_configurados": total_canais,
         "canais_ativos": canais_ativos,
         "total_bots": total_bots,
-        "status_sessao": status_sessao
+        "posts_enviados_hoje": posts_hoje,
+        "status_sessao": status_sessao,
+        "engine": engine_info
     }
 
 # ==========================================
-# 5. ROTA DE MIGRAÇÃO (Acessar via URL para aplicar novas colunas)
+# 5. ROTAS DO ENGINE (STATUS + CONTROLE)
+# ==========================================
+@app.get("/api/engine/status")
+def engine_status_route(user_id: str = Depends(get_current_user)):
+    """Retorna o status atual do motor AutoPost"""
+    return get_engine_status()
+
+# ==========================================
+# 6. ROTAS DA FILA DE ENVIOS
+# ==========================================
+@app.get("/api/autopost/queue")
+def list_queue(
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    status_filter: Optional[str] = None,
+    limit: int = 50
+):
+    """Lista itens da fila de envios do usuário"""
+    # Busca IDs dos canais do usuário
+    user_channel_ids = [
+        ch.id for ch in 
+        db.query(AutopostChannel).filter(AutopostChannel.user_id == user_id).all()
+    ]
+    
+    if not user_channel_ids:
+        return []
+    
+    query = db.query(AutopostQueue).filter(
+        AutopostQueue.channel_pair_id.in_(user_channel_ids)
+    )
+    
+    if status_filter:
+        query = query.filter(AutopostQueue.status == status_filter)
+    
+    items = query.order_by(AutopostQueue.id.desc()).limit(limit).all()
+    
+    result = []
+    for item in items:
+        # Puxa nome do canal vinculado
+        canal = db.query(AutopostChannel).filter(AutopostChannel.id == item.channel_pair_id).first()
+        result.append({
+            "id": item.id,
+            "channel_pair_id": item.channel_pair_id,
+            "origin_channel_name": canal.origin_channel_name if canal else "—",
+            "dest_channel_name": canal.dest_channel_name if canal else "—",
+            "origin_msg_id": item.origin_msg_id,
+            "media_type": item.media_type,
+            "content_json": item.content_json,
+            "status": item.status,
+            "scheduled_for": item.scheduled_for.isoformat() if item.scheduled_for else None,
+            "sent_at": item.sent_at.isoformat() if item.sent_at else None,
+            "error_msg": item.error_msg,
+        })
+    
+    return result
+
+@app.delete("/api/autopost/queue/{item_id}")
+def delete_queue_item(item_id: int, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Remove um item da fila"""
+    item = db.query(AutopostQueue).filter(AutopostQueue.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item não encontrado.")
+    
+    # Verifica se o canal pertence ao usuário
+    canal = db.query(AutopostChannel).filter(
+        AutopostChannel.id == item.channel_pair_id,
+        AutopostChannel.user_id == user_id
+    ).first()
+    if not canal:
+        raise HTTPException(status_code=403, detail="Sem permissão.")
+    
+    db.delete(item)
+    db.commit()
+    return {"message": "Item removido da fila!"}
+
+# ==========================================
+# 7. ROTAS DE LOGS / HISTÓRICO
+# ==========================================
+@app.get("/api/autopost/logs")
+def list_logs(
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    action_filter: Optional[str] = None,
+    limit: int = 100
+):
+    """Lista logs de atividade do usuário"""
+    query = db.query(AutopostLog).filter(AutopostLog.user_id == user_id)
+    
+    if action_filter:
+        query = query.filter(AutopostLog.action == action_filter)
+    
+    logs = query.order_by(AutopostLog.id.desc()).limit(limit).all()
+    
+    return [
+        {
+            "id": log.id,
+            "action": log.action,
+            "details": log.details,
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+        }
+        for log in logs
+    ]
+
+@app.delete("/api/autopost/logs")
+def clear_logs(user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Limpa todos os logs do usuário"""
+    db.query(AutopostLog).filter(AutopostLog.user_id == user_id).delete()
+    db.commit()
+    return {"message": "Histórico limpo com sucesso!"}
+
+# ==========================================
+# 8. ROTA DE MIGRAÇÃO (Acessar via URL para aplicar novas colunas)
 # ==========================================
 @app.get("/api/migrate")
 def run_migration(db: Session = Depends(get_db)):
