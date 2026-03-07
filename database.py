@@ -61,11 +61,11 @@ class AutopostChannel(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String, nullable=False) 
     session_id = Column(Integer, ForeignKey("autopost_sessions_v2.id"))
-    bot_id = Column(Integer, ForeignKey("autopost_bots.id"), nullable=True)  # 👈 NOVO: Vincula ao bot da ponte
+    bot_id = Column(Integer, ForeignKey("autopost_bots.id"), nullable=True)
     bot_token = Column(String, nullable=True)
     origin_channel_id = Column(BigInteger)
     origin_channel_name = Column(String)
-    dest_channel_id = Column(BigInteger)
+    dest_channel_id = Column(BigInteger)        # Destino principal (legado, mantido por compatibilidade)
     dest_channel_name = Column(String)
     channel_type = Column(String) 
     interval_minutes = Column(Integer, default=30)
@@ -74,13 +74,32 @@ class AutopostChannel(Base):
     cta_find = Column(Text, nullable=True)
     cta_replace = Column(Text, nullable=True)
     post_order = Column(String, default="fifo") 
+    # 👇 NOVOS: Legenda personalizada com formatação HTML/Telegram
+    custom_caption = Column(Text, nullable=True)       # Legenda HTML personalizada
+    use_custom_caption = Column(Boolean, default=False) # Toggle ativar/desativar
+    caption_mode = Column(String, default="replace")    # "replace" ou "append"
     is_active = Column(Boolean, default=True)
     last_post_id = Column(Integer, default=0)
     total_forwarded = Column(Integer, default=0)
     created_at = Column(DateTime, default=now_brazil)
     session = relationship("AutopostSession", back_populates="channels")
-    bot = relationship("AutopostBot", back_populates="channels", foreign_keys=[bot_id])  # 👈 NOVO
+    bot = relationship("AutopostBot", back_populates="channels", foreign_keys=[bot_id])
     queue = relationship("AutopostQueue", back_populates="channel_pair", cascade="all, delete-orphan")
+    # 👇 NOVO: Múltiplos destinos
+    destinations = relationship("AutopostDestination", back_populates="channel", cascade="all, delete-orphan")
+
+# 👇 NOVA TABELA: MÚLTIPLOS DESTINOS POR CANAL 👇
+class AutopostDestination(Base):
+    __tablename__ = "autopost_destinations"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    channel_id = Column(Integer, ForeignKey("autopost_channels_v2.id"), nullable=False)
+    dest_channel_id = Column(BigInteger, nullable=False)
+    dest_channel_name = Column(String)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=now_brazil)
+    
+    channel = relationship("AutopostChannel", back_populates="destinations")
 
 class AutopostQueue(Base):
     __tablename__ = "autopost_queue_v2" 

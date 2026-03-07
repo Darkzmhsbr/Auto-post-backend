@@ -13,7 +13,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
-from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, engine, Base
+from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination, engine, Base
 from engine import start_engine, stop_engine, get_engine_status
 
 init_db()
@@ -91,26 +91,46 @@ class BotResponse(BaseModel):
     class Config:
         from_attributes = True
 
-# 👇 Modelos de Canais (atualizados com bot_id e campos de agendamento) 👇
+# 👇 Modelo de Destino (para múltiplos destinos por canal) 👇
+class DestinationCreate(BaseModel):
+    dest_channel_id: int
+    dest_channel_name: str
+
+class DestinationResponse(BaseModel):
+    id: int
+    dest_channel_id: int
+    dest_channel_name: str
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+# 👇 Modelos de Canais (com múltiplos destinos + legenda personalizada) 👇
 class ChannelCreate(BaseModel):
     bot_id: Optional[int] = None
     origin_channel_id: int
     origin_channel_name: str
-    dest_channel_id: int
+    dest_channel_id: int              # Destino principal (legado)
     dest_channel_name: str
     channel_type: str
     interval_minutes: int
-    schedule_start: Optional[str] = None  # Formato "HH:MM"
-    schedule_end: Optional[str] = None    # Formato "HH:MM"
+    schedule_start: Optional[str] = None
+    schedule_end: Optional[str] = None
     post_order: Optional[str] = "fifo"
     cta_find: Optional[str] = None
     cta_replace: Optional[str] = None
+    # Legenda personalizada
+    custom_caption: Optional[str] = None
+    use_custom_caption: Optional[bool] = False
+    caption_mode: Optional[str] = "replace"   # "replace" ou "append"
+    # Destinos adicionais (além do principal)
+    extra_destinations: Optional[List[DestinationCreate]] = None
 
 class ChannelResponse(BaseModel):
     id: int
     bot_id: Optional[int] = None
-    bot_name: Optional[str] = None      # 👈 Nome do bot vinculado (preenchido na rota)
-    bot_username: Optional[str] = None  # 👈 @username do bot vinculado
+    bot_name: Optional[str] = None
+    bot_username: Optional[str] = None
     origin_channel_id: int
     origin_channel_name: str
     dest_channel_id: int
@@ -122,8 +142,12 @@ class ChannelResponse(BaseModel):
     post_order: Optional[str] = "fifo"
     cta_find: Optional[str] = None
     cta_replace: Optional[str] = None
+    custom_caption: Optional[str] = None
+    use_custom_caption: Optional[bool] = False
+    caption_mode: Optional[str] = "replace"
     is_active: bool
     total_forwarded: int
+    destinations: Optional[List[DestinationResponse]] = []  # Todos os destinos
 
     class Config:
         from_attributes = True
@@ -245,9 +269,9 @@ def delete_bot(bot_id: int, user_id: str = Depends(get_current_user), db: Sessio
 # 3. ROTAS DE CANAIS (CLONAGEM/AUTOPOST)
 # ==========================================
 
-# Helper para serializar canal com dados do bot
+# Helper para serializar canal com dados do bot + destinos
 def _serialize_channel(canal, db):
-    """Converte AutopostChannel em dict com bot_name e bot_username"""
+    """Converte AutopostChannel em dict com bot_name, bot_username e destinations"""
     data = {
         "id": canal.id,
         "bot_id": canal.bot_id,
@@ -264,8 +288,12 @@ def _serialize_channel(canal, db):
         "post_order": canal.post_order or "fifo",
         "cta_find": canal.cta_find,
         "cta_replace": canal.cta_replace,
+        "custom_caption": canal.custom_caption,
+        "use_custom_caption": canal.use_custom_caption or False,
+        "caption_mode": canal.caption_mode or "replace",
         "is_active": canal.is_active,
         "total_forwarded": canal.total_forwarded or 0,
+        "destinations": [],
     }
     # Puxa nome do bot se vinculado
     if canal.bot_id:
@@ -273,6 +301,13 @@ def _serialize_channel(canal, db):
         if bot:
             data["bot_name"] = bot.bot_name
             data["bot_username"] = bot.bot_username
+    
+    # Puxa destinos adicionais
+    dests = db.query(AutopostDestination).filter(AutopostDestination.channel_id == canal.id).all()
+    data["destinations"] = [
+        {"id": d.id, "dest_channel_id": d.dest_channel_id, "dest_channel_name": d.dest_channel_name, "is_active": d.is_active}
+        for d in dests
+    ]
     return data
 
 @app.get("/api/autopost/channels")
@@ -284,7 +319,6 @@ def list_channels(user_id: str = Depends(get_current_user), db: Session = Depend
 def create_channel(canal: ChannelCreate, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
     from datetime import time as dt_time
     
-    # Converte strings "HH:MM" para objetos Time
     start_time = None
     end_time = None
     if canal.schedule_start:
@@ -294,7 +328,6 @@ def create_channel(canal: ChannelCreate, user_id: str = Depends(get_current_user
         parts = canal.schedule_end.split(":")
         end_time = dt_time(int(parts[0]), int(parts[1]))
     
-    # Se bot_id fornecido, valida se pertence ao usuário
     if canal.bot_id:
         bot = db.query(AutopostBot).filter(AutopostBot.id == canal.bot_id, AutopostBot.user_id == user_id).first()
         if not bot:
@@ -313,12 +346,71 @@ def create_channel(canal: ChannelCreate, user_id: str = Depends(get_current_user
         schedule_end=end_time,
         post_order=canal.post_order or "fifo",
         cta_find=canal.cta_find,
-        cta_replace=canal.cta_replace
+        cta_replace=canal.cta_replace,
+        custom_caption=canal.custom_caption,
+        use_custom_caption=canal.use_custom_caption or False,
+        caption_mode=canal.caption_mode or "replace",
     )
     db.add(novo_canal)
     db.commit()
     db.refresh(novo_canal)
+    
+    # Cria destinos adicionais se fornecidos
+    if canal.extra_destinations:
+        for dest in canal.extra_destinations:
+            new_dest = AutopostDestination(
+                channel_id=novo_canal.id,
+                dest_channel_id=dest.dest_channel_id,
+                dest_channel_name=dest.dest_channel_name,
+            )
+            db.add(new_dest)
+        db.commit()
+    
     return _serialize_channel(novo_canal, db)
+
+# CRUD de Destinos individuais (adicionar/remover destinos após criação)
+@app.post("/api/autopost/channels/{channel_id}/destinations")
+def add_destination(channel_id: int, dest: DestinationCreate, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    canal = db.query(AutopostChannel).filter(AutopostChannel.id == channel_id, AutopostChannel.user_id == user_id).first()
+    if not canal:
+        raise HTTPException(status_code=404, detail="Canal não encontrado.")
+    new_dest = AutopostDestination(
+        channel_id=channel_id,
+        dest_channel_id=dest.dest_channel_id,
+        dest_channel_name=dest.dest_channel_name,
+    )
+    db.add(new_dest)
+    db.commit()
+    db.refresh(new_dest)
+    return {"id": new_dest.id, "dest_channel_id": new_dest.dest_channel_id, "dest_channel_name": new_dest.dest_channel_name, "is_active": new_dest.is_active}
+
+@app.delete("/api/autopost/channels/{channel_id}/destinations/{dest_id}")
+def remove_destination(channel_id: int, dest_id: int, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    canal = db.query(AutopostChannel).filter(AutopostChannel.id == channel_id, AutopostChannel.user_id == user_id).first()
+    if not canal:
+        raise HTTPException(status_code=404, detail="Canal não encontrado.")
+    dest = db.query(AutopostDestination).filter(AutopostDestination.id == dest_id, AutopostDestination.channel_id == channel_id).first()
+    if not dest:
+        raise HTTPException(status_code=404, detail="Destino não encontrado.")
+    db.delete(dest)
+    db.commit()
+    return {"message": "Destino removido!"}
+
+# Rota para atualizar legenda personalizada
+@app.put("/api/autopost/channels/{channel_id}/caption")
+def update_caption(channel_id: int, user_id: str = Depends(get_current_user), db: Session = Depends(get_db), body: dict = None):
+    canal = db.query(AutopostChannel).filter(AutopostChannel.id == channel_id, AutopostChannel.user_id == user_id).first()
+    if not canal:
+        raise HTTPException(status_code=404, detail="Canal não encontrado.")
+    
+    if body is None:
+        raise HTTPException(status_code=400, detail="Corpo da requisição vazio.")
+    
+    canal.custom_caption = body.get("custom_caption", canal.custom_caption)
+    canal.use_custom_caption = body.get("use_custom_caption", canal.use_custom_caption)
+    canal.caption_mode = body.get("caption_mode", canal.caption_mode)
+    db.commit()
+    return {"message": "Legenda atualizada!", "custom_caption": canal.custom_caption, "use_custom_caption": canal.use_custom_caption, "caption_mode": canal.caption_mode}
 
 @app.delete("/api/autopost/channels/{channel_id}")
 def delete_channel(channel_id: int, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -506,8 +598,11 @@ def run_migration(db: Session = Depends(get_db)):
     Rota de migração manual. Acesse:
     https://api-autopost.zenyxvips.com/api/migrate
     
-    Adiciona a coluna bot_id na tabela autopost_channels_v2
-    (e cria a tabela autopost_bots se não existir).
+    Migrações:
+    - Tabela autopost_bots (se não existir)
+    - Coluna bot_id em autopost_channels_v2
+    - Tabela autopost_destinations (múltiplos destinos)
+    - Colunas custom_caption, use_custom_caption, caption_mode em autopost_channels_v2
     """
     from sqlalchemy import text, inspect
     
@@ -520,19 +615,34 @@ def run_migration(db: Session = Depends(get_db)):
         # 1. Cria tabela autopost_bots se não existir
         if "autopost_bots" not in existing_tables:
             Base.metadata.tables["autopost_bots"].create(bind=engine)
-            results.append("✅ Tabela 'autopost_bots' criada com sucesso!")
+            results.append("✅ Tabela 'autopost_bots' criada!")
         else:
             results.append("ℹ️ Tabela 'autopost_bots' já existe.")
         
-        # 2. Adiciona coluna bot_id em autopost_channels_v2 se não existir
+        # 2. Colunas em autopost_channels_v2
         columns = [col["name"] for col in inspector.get_columns("autopost_channels_v2")]
         
-        if "bot_id" not in columns:
-            db.execute(text("ALTER TABLE autopost_channels_v2 ADD COLUMN bot_id INTEGER REFERENCES autopost_bots(id)"))
-            db.commit()
-            results.append("✅ Coluna 'bot_id' adicionada em 'autopost_channels_v2'!")
+        new_columns = {
+            "bot_id": "INTEGER REFERENCES autopost_bots(id)",
+            "custom_caption": "TEXT",
+            "use_custom_caption": "BOOLEAN DEFAULT FALSE",
+            "caption_mode": "VARCHAR DEFAULT 'replace'",
+        }
+        
+        for col_name, col_def in new_columns.items():
+            if col_name not in columns:
+                db.execute(text(f"ALTER TABLE autopost_channels_v2 ADD COLUMN {col_name} {col_def}"))
+                db.commit()
+                results.append(f"✅ Coluna '{col_name}' adicionada em 'autopost_channels_v2'!")
+            else:
+                results.append(f"ℹ️ Coluna '{col_name}' já existe.")
+        
+        # 3. Cria tabela autopost_destinations se não existir
+        if "autopost_destinations" not in existing_tables:
+            Base.metadata.tables["autopost_destinations"].create(bind=engine)
+            results.append("✅ Tabela 'autopost_destinations' criada!")
         else:
-            results.append("ℹ️ Coluna 'bot_id' já existe em 'autopost_channels_v2'.")
+            results.append("ℹ️ Tabela 'autopost_destinations' já existe.")
         
         return {"status": "success", "migrations": results}
     

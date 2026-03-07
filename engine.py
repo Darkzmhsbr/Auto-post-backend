@@ -19,7 +19,7 @@ from telethon.tl.types import (
     MessageMediaWebPage, MessageMediaContact
 )
 
-from database import SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog
+from database import SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination
 
 # ==========================================
 # CONFIGURAÇÃO
@@ -63,6 +63,49 @@ def apply_cta_replacement(text, cta_find, cta_replace):
     if not text or not cta_find:
         return text
     return text.replace(cta_find, cta_replace or '')
+
+
+def apply_custom_caption(original_text, channel):
+    """Aplica legenda personalizada se configurada"""
+    if not channel.use_custom_caption or not channel.custom_caption:
+        return original_text
+    
+    if channel.caption_mode == 'append':
+        # Adiciona a legenda personalizada abaixo da original
+        separator = "\n\n" if original_text else ""
+        return (original_text or '') + separator + channel.custom_caption
+    else:
+        # Substitui completamente a legenda original
+        return channel.custom_caption
+
+
+def get_all_dest_channel_ids(channel, db):
+    """
+    Retorna lista de todos os IDs de destino (principal + extras).
+    Cada item é dict: {id, dest_channel_id, dest_channel_name}
+    """
+    destinations = []
+    
+    # Destino principal (legado)
+    if channel.dest_channel_id:
+        destinations.append({
+            "dest_channel_id": int(channel.dest_channel_id),
+            "dest_channel_name": channel.dest_channel_name or "Principal",
+        })
+    
+    # Destinos adicionais
+    extras = db.query(AutopostDestination).filter(
+        AutopostDestination.channel_id == channel.id,
+        AutopostDestination.is_active == True
+    ).all()
+    
+    for d in extras:
+        destinations.append({
+            "dest_channel_id": int(d.dest_channel_id),
+            "dest_channel_name": d.dest_channel_name or f"Destino #{d.id}",
+        })
+    
+    return destinations
 
 
 def create_log(db, user_id, action, details=None):
@@ -187,8 +230,8 @@ def _get_bot_record(channel, db):
 
 async def process_clone(userbot, channel, msg_group, db):
     """
-    MODO CLONE: Copia texto/mídia e reposta como novo no destino.
-    Suporta posts individuais e álbuns (grouped_id).
+    MODO CLONE: Copia texto/mídia e reposta como novo.
+    Suporta álbuns, múltiplos destinos, e legenda personalizada.
     """
     dest_client = userbot
     bot_record = _get_bot_record(channel, db)
@@ -203,51 +246,57 @@ async def process_clone(userbot, channel, msg_group, db):
     is_album = len(msg_group) > 1
     first_msg = msg_group[0]
     msg_ids = [m.id for m in msg_group]
+    all_destinations = get_all_dest_channel_ids(channel, db)
+    
+    if not all_destinations:
+        logger.warning(f"CLONE | Canal {channel.id} sem destinos configurados.")
+        return None
 
     try:
+        # Prepara conteúdo uma vez
         if is_album:
-            # ===== ÁLBUM: Envia todas as mídias juntas =====
             media_files = []
             album_caption = None
-
             for msg in msg_group:
                 if msg.media:
                     media_files.append(msg.media)
                 msg_text = msg.text or msg.message or ''
                 if msg_text and album_caption is None:
                     album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace)
-
+            
+            # Aplica legenda personalizada
+            album_caption = apply_custom_caption(album_caption, channel)
+            
             if not media_files:
                 return None
-
-            # send_file com lista = envia como álbum nativo do Telegram
-            await dest_client.send_file(
-                int(channel.dest_channel_id),
-                file=media_files,
-                caption=album_caption if album_caption else None
-            )
-
+            
+            # Envia para CADA destino
+            for dest in all_destinations:
+                try:
+                    await dest_client.send_file(
+                        dest["dest_channel_id"],
+                        file=media_files,
+                        caption=album_caption if album_caption else None
+                    )
+                    logger.info(f"CLONE ÁLBUM | Canal {channel.id} | {len(media_files)} mídias → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
+                except Exception as e:
+                    logger.error(f"CLONE ÁLBUM ERRO | destino {dest['dest_channel_id']}: {e}")
+                await asyncio.sleep(0.5)  # Delay entre destinos
+            
             queue_entry = create_queue_entry(
                 db, channel.id, first_msg.id, f"album_{len(media_files)}",
-                {
-                    "text_preview": (album_caption or "")[:200],
-                    "mode": "clone",
-                    "album_size": len(media_files),
-                    "msg_ids": msg_ids
-                },
+                {"text_preview": (album_caption or "")[:200], "mode": "clone", "album_size": len(media_files), "msg_ids": msg_ids, "destinations": len(all_destinations)},
                 status="sent"
             )
             queue_entry.sent_at = now_brazil()
             db.commit()
-
-            logger.info(f"CLONE ÁLBUM | Canal {channel.id} | {len(media_files)} mídias (msgs {msg_ids}) → destino {channel.dest_channel_id}")
             return queue_entry
 
         else:
-            # ===== POST INDIVIDUAL =====
             msg = first_msg
             text = msg.text or msg.message or ''
             text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace)
+            text = apply_custom_caption(text, channel)
             media_type = "text"
 
             if msg.media:
@@ -258,43 +307,39 @@ async def process_clone(userbot, channel, msg_group, db):
                 else:
                     media_type = "other_media"
 
-                await dest_client.send_message(
-                    int(channel.dest_channel_id),
-                    message=text if text else None,
-                    file=msg.media
-                )
-            else:
-                if text:
-                    await dest_client.send_message(int(channel.dest_channel_id), message=text)
-                else:
-                    return None
+            for dest in all_destinations:
+                try:
+                    if msg.media:
+                        await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=msg.media)
+                    elif text:
+                        await dest_client.send_message(dest["dest_channel_id"], message=text)
+                    else:
+                        continue
+                    logger.info(f"CLONE | Canal {channel.id} | msg {msg.id} → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
+                except Exception as e:
+                    logger.error(f"CLONE ERRO | destino {dest['dest_channel_id']}: {e}")
+                await asyncio.sleep(0.5)
 
             queue_entry = create_queue_entry(
                 db, channel.id, msg.id, media_type,
-                {"text_preview": text[:200] if text else "", "mode": "clone"},
+                {"text_preview": text[:200] if text else "", "mode": "clone", "destinations": len(all_destinations)},
                 status="sent"
             )
             queue_entry.sent_at = now_brazil()
             db.commit()
-
-            logger.info(f"CLONE | Canal {channel.id} | msg {msg.id} → destino {channel.dest_channel_id}")
             return queue_entry
 
     except Exception as e:
         error_msg = str(e)
-        create_queue_entry(
-            db, channel.id, first_msg.id, "error",
-            {"error": error_msg, "mode": "clone", "msg_ids": msg_ids},
-            status="error"
-        )
+        create_queue_entry(db, channel.id, first_msg.id, "error", {"error": error_msg, "mode": "clone", "msg_ids": msg_ids}, status="error")
         logger.error(f"CLONE ERRO | Canal {channel.id} | msgs {msg_ids}: {error_msg}")
         return None
 
 
 async def process_forward(userbot, channel, msg_group, db):
     """
-    MODO FORWARD: Encaminha nativamente (forward) as mensagens.
-    forward_messages com lista de IDs preserva o álbum automaticamente!
+    MODO FORWARD: Encaminha nativamente para múltiplos destinos.
+    forward_messages com lista de IDs preserva álbuns.
     """
     dest_client = userbot
     bot_record = _get_bot_record(channel, db)
@@ -307,55 +352,53 @@ async def process_forward(userbot, channel, msg_group, db):
     is_album = len(msg_group) > 1
     first_msg = msg_group[0]
     msg_ids = [m.id for m in msg_group]
+    all_destinations = get_all_dest_channel_ids(channel, db)
+
+    if not all_destinations:
+        logger.warning(f"FORWARD | Canal {channel.id} sem destinos configurados.")
+        return None
 
     try:
-        # forward_messages aceita lista de IDs → preserva álbum!
-        await dest_client.forward_messages(
-            int(channel.dest_channel_id),
-            msg_ids,
-            int(channel.origin_channel_id)
-        )
+        for dest in all_destinations:
+            try:
+                await dest_client.forward_messages(
+                    dest["dest_channel_id"],
+                    msg_ids,
+                    int(channel.origin_channel_id)
+                )
+                if is_album:
+                    logger.info(f"FORWARD ÁLBUM | Canal {channel.id} | {len(msg_ids)} msgs → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
+                else:
+                    logger.info(f"FORWARD | Canal {channel.id} | msg {first_msg.id} → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
+            except Exception as e:
+                logger.error(f"FORWARD ERRO | destino {dest['dest_channel_id']}: {e}")
+            await asyncio.sleep(0.5)
 
         media_type = f"forward_album_{len(msg_ids)}" if is_album else "forward"
         text_preview = first_msg.text or first_msg.message or ""
 
         queue_entry = create_queue_entry(
             db, channel.id, first_msg.id, media_type,
-            {
-                "text_preview": text_preview[:200],
-                "mode": "forward",
-                "album_size": len(msg_ids) if is_album else 1,
-                "msg_ids": msg_ids
-            },
+            {"text_preview": text_preview[:200], "mode": "forward", "album_size": len(msg_ids) if is_album else 1, "msg_ids": msg_ids, "destinations": len(all_destinations)},
             status="sent"
         )
         queue_entry.sent_at = now_brazil()
         db.commit()
-
-        if is_album:
-            logger.info(f"FORWARD ÁLBUM | Canal {channel.id} | {len(msg_ids)} msgs ({msg_ids}) → destino {channel.dest_channel_id}")
-        else:
-            logger.info(f"FORWARD | Canal {channel.id} | msg {first_msg.id} → destino {channel.dest_channel_id}")
-
         return queue_entry
 
     except Exception as e:
         error_msg = str(e)
-        create_queue_entry(
-            db, channel.id, first_msg.id, "error",
-            {"error": error_msg, "mode": "forward", "msg_ids": msg_ids},
-            status="error"
-        )
+        create_queue_entry(db, channel.id, first_msg.id, "error", {"error": error_msg, "mode": "forward", "msg_ids": msg_ids}, status="error")
         logger.error(f"FORWARD ERRO | Canal {channel.id} | msgs {msg_ids}: {error_msg}")
         return None
 
 
 async def process_spy(userbot, channel, msg_group, db):
     """
-    MODO ESPIONAR (PONTE PREMIUM):
-    1. Userbot lê do concorrente (origem)
-    2. Userbot clona pro Canal Oculto (álbuns preservados via send_file com lista)
-    3. Bot oficial encaminha do Canal Oculto → Destino final (forward com lista de IDs)
+    MODO ESPIONAR (PONTE PREMIUM) com múltiplos destinos:
+    1. Userbot lê do concorrente
+    2. Userbot clona pro Canal Oculto (com legenda personalizada se configurada)
+    3. Bot oficial encaminha do Canal Oculto → TODOS os destinos configurados
     """
     if not channel.bot_id:
         logger.warning(f"SPY | Canal {channel.id} sem bot vinculado. Fazendo clone direto.")
@@ -363,96 +406,86 @@ async def process_spy(userbot, channel, msg_group, db):
 
     bot_record = db.query(AutopostBot).filter(AutopostBot.id == channel.bot_id).first()
     if not bot_record:
-        logger.warning(f"SPY | Bot {channel.bot_id} não encontrado. Fazendo clone direto.")
         return await process_clone(userbot, channel, msg_group, db)
 
     bot_client = await get_bot_client(bot_record.bot_token)
     if not bot_client:
-        logger.warning(f"SPY | Bot {bot_record.bot_name} offline. Fazendo clone direto.")
         return await process_clone(userbot, channel, msg_group, db)
 
     is_album = len(msg_group) > 1
     first_msg = msg_group[0]
     msg_ids = [m.id for m in msg_group]
     bridge_channel_id = int(bot_record.origin_channel_id)
-    dest_channel_id = int(bot_record.dest_channel_id)
+    
+    # Coleta todos os destinos (principal + extras)
+    all_destinations = get_all_dest_channel_ids(channel, db)
+    if not all_destinations:
+        all_destinations = [{"dest_channel_id": int(bot_record.dest_channel_id), "dest_channel_name": "Bot Destino"}]
 
     try:
         if is_album:
-            # ===== ÁLBUM VIA PONTE =====
             media_files = []
             album_caption = None
-
             for msg in msg_group:
                 if msg.media:
                     media_files.append(msg.media)
                 msg_text = msg.text or msg.message or ''
                 if msg_text and album_caption is None:
                     album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace)
-
+            
+            album_caption = apply_custom_caption(album_caption, channel)
             if not media_files:
                 return None
 
             # PASSO 1: Userbot envia álbum pro Canal Oculto
-            bridge_msgs = await userbot.send_file(
-                bridge_channel_id,
-                file=media_files,
-                caption=album_caption if album_caption else None
-            )
-
+            bridge_msgs = await userbot.send_file(bridge_channel_id, file=media_files, caption=album_caption if album_caption else None)
             await asyncio.sleep(1.5)
 
-            # PASSO 2: Bot encaminha o álbum do Canal Oculto → Destino
             if isinstance(bridge_msgs, list):
                 bridge_msg_ids = [m.id for m in bridge_msgs]
             else:
                 bridge_msg_ids = [bridge_msgs.id]
 
-            await bot_client.forward_messages(
-                dest_channel_id,
-                bridge_msg_ids,
-                bridge_channel_id
-            )
+            # PASSO 2: Bot encaminha para TODOS os destinos
+            for dest in all_destinations:
+                try:
+                    await bot_client.forward_messages(dest["dest_channel_id"], bridge_msg_ids, bridge_channel_id)
+                    logger.info(f"SPY ÁLBUM PONTE | Canal {channel.id} → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
+                except Exception as e:
+                    logger.error(f"SPY ÁLBUM ERRO | destino {dest['dest_channel_id']}: {e}")
+                await asyncio.sleep(0.5)
 
             media_type = f"spy_album_{len(media_files)}"
 
         else:
-            # ===== POST INDIVIDUAL VIA PONTE =====
             msg = first_msg
             text = msg.text or msg.message or ''
             text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace)
+            text = apply_custom_caption(text, channel)
 
             if msg.media:
-                bridge_msg = await userbot.send_message(
-                    bridge_channel_id,
-                    message=text if text else None,
-                    file=msg.media
-                )
+                bridge_msg = await userbot.send_message(bridge_channel_id, message=text if text else None, file=msg.media)
+            elif text:
+                bridge_msg = await userbot.send_message(bridge_channel_id, message=text)
             else:
-                if not text:
-                    return None
-                bridge_msg = await userbot.send_message(
-                    bridge_channel_id,
-                    message=text
-                )
+                return None
 
             await asyncio.sleep(1)
-
             bridge_msg_ids = [bridge_msg.id]
-            await bot_client.forward_messages(
-                dest_channel_id,
-                bridge_msg_ids,
-                bridge_channel_id
-            )
+
+            for dest in all_destinations:
+                try:
+                    await bot_client.forward_messages(dest["dest_channel_id"], bridge_msg_ids, bridge_channel_id)
+                    logger.info(f"SPY PONTE | Canal {channel.id} | msg {first_msg.id} → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
+                except Exception as e:
+                    logger.error(f"SPY ERRO | destino {dest['dest_channel_id']}: {e}")
+                await asyncio.sleep(0.5)
 
             media_type = "spy_bridge"
             if msg.media:
-                if isinstance(msg.media, MessageMediaPhoto):
-                    media_type = "spy_photo"
-                elif isinstance(msg.media, MessageMediaDocument):
-                    media_type = "spy_document"
+                if isinstance(msg.media, MessageMediaPhoto): media_type = "spy_photo"
+                elif isinstance(msg.media, MessageMediaDocument): media_type = "spy_document"
 
-        # Registra na fila
         text_preview = ""
         for m in msg_group:
             t = m.text or m.message or ''
@@ -462,33 +495,16 @@ async def process_spy(userbot, channel, msg_group, db):
 
         queue_entry = create_queue_entry(
             db, channel.id, first_msg.id, media_type,
-            {
-                "text_preview": text_preview,
-                "mode": "spy",
-                "bridge_channel": str(bridge_channel_id),
-                "album_size": len(msg_group),
-                "msg_ids": msg_ids,
-                "bot_name": bot_record.bot_name
-            },
+            {"text_preview": text_preview, "mode": "spy", "bridge_channel": str(bridge_channel_id), "album_size": len(msg_group), "msg_ids": msg_ids, "bot_name": bot_record.bot_name, "destinations": len(all_destinations)},
             status="sent"
         )
         queue_entry.sent_at = now_brazil()
         db.commit()
-
-        if is_album:
-            logger.info(f"SPY ÁLBUM PONTE | Canal {channel.id} | {len(msg_group)} mídias → ponte {bridge_channel_id} → destino {dest_channel_id}")
-        else:
-            logger.info(f"SPY PONTE | Canal {channel.id} | msg {first_msg.id} → ponte {bridge_channel_id} → destino {dest_channel_id}")
-
         return queue_entry
 
     except Exception as e:
         error_msg = str(e)
-        create_queue_entry(
-            db, channel.id, first_msg.id, "error",
-            {"error": error_msg, "mode": "spy", "bot_name": bot_record.bot_name, "msg_ids": msg_ids},
-            status="error"
-        )
+        create_queue_entry(db, channel.id, first_msg.id, "error", {"error": error_msg, "mode": "spy", "bot_name": bot_record.bot_name, "msg_ids": msg_ids}, status="error")
         logger.error(f"SPY ERRO | Canal {channel.id} | msgs {msg_ids}: {error_msg}")
         return None
 
@@ -657,8 +673,8 @@ def run_engine_tick():
     # Executa no loop do uvicorn (mesmo loop onde Telethon conectou)
     future = asyncio.run_coroutine_threadsafe(engine_tick(), _main_loop)
     try:
-        # Aguarda até 55 segundos (antes do próximo tick de 60s)
-        future.result(timeout=55)
+        # Aguarda até 25 segundos (antes do próximo tick de 30s)
+        future.result(timeout=25)
     except Exception as e:
         logger.error(f"Erro no engine tick: {e}")
 
@@ -688,7 +704,7 @@ def start_engine():
     _scheduler.add_job(
         run_engine_tick,
         'interval',
-        seconds=60,
+        seconds=30,
         id='autopost_engine_tick',
         name='AutoPost Engine Tick',
         replace_existing=True,
@@ -696,7 +712,7 @@ def start_engine():
         coalesce=True
     )
     _scheduler.start()
-    logger.info("🚀 AutoPost Engine v2 (Album Support) iniciado! Tick a cada 60s.")
+    logger.info("🚀 AutoPost Engine v3 (Multi-Dest + Custom Caption) iniciado! Tick a cada 30s.")
 
 
 def stop_engine():
