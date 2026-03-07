@@ -370,22 +370,15 @@ async def process_clone(userbot, channel, msg_group, db):
                 except Exception as e:
                     logger.error(f"Erro ao baixar mídia única: {e}")
 
-            # Detecta se a mensagem pertence a um tópico (forum)
-            reply_to = None
-            if hasattr(msg, 'reply_to') and msg.reply_to:
-                topic_id = getattr(msg.reply_to, 'reply_to_top_id', None) or getattr(msg.reply_to, 'reply_to_msg_id', None)
-                if topic_id:
-                    reply_to = topic_id
-
             for dest in all_destinations:
                 try:
                     if msg.media:
-                        await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=downloaded_file or msg.media, parse_mode='html', reply_to=reply_to)
+                        await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=downloaded_file or msg.media, parse_mode='html')
                     elif text:
-                        await dest_client.send_message(dest["dest_channel_id"], message=text, parse_mode='html', reply_to=reply_to)
+                        await dest_client.send_message(dest["dest_channel_id"], message=text, parse_mode='html')
                     else:
                         continue
-                    logger.info(f"CLONE | Canal {channel.id} | msg {msg.id} → {dest['dest_channel_name']} ({dest['dest_channel_id']}){' [tópico]' if reply_to else ''}")
+                    logger.info(f"CLONE | Canal {channel.id} | msg {msg.id} → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
                 except Exception as e:
                     logger.error(f"CLONE ERRO | destino {dest['dest_channel_id']}: {e}")
                 await asyncio.sleep(0.5)
@@ -682,32 +675,20 @@ async def process_channel(channel, session_record, db):
         origin_id = int(channel.origin_channel_id)
         min_id = channel.last_post_id or 0
 
-        # reverse=True = retorna do mais antigo ao mais recente (cronológico)
-        # Isso garante que ao clonar, começa pelo post mais antigo do canal
         messages = await userbot.get_messages(
             origin_id,
             min_id=min_id,
-            limit=20,
-            reverse=True
+            limit=20
         )
 
         if not messages:
             return 0
 
-        new_messages = [m for m in messages if m and m.id > min_id and (m.message is not None or m.media is not None)]
+        new_messages = [m for m in messages if m.id > min_id and (m.message is not None or m.media is not None)]
 
         if not new_messages:
-            # Se não tem mensagens com conteúdo, avança para não ficar preso
-            if messages:
-                valid_msgs = [m for m in messages if m and hasattr(m, 'id')]
-                if valid_msgs:
-                    max_id = max(m.id for m in valid_msgs)
-                    if max_id > min_id:
-                        channel.last_post_id = max_id
-                        db.commit()
             return 0
 
-        # Já vem em ordem cronológica (antigo → recente) por causa do reverse=True
         new_messages.sort(key=lambda m: m.id)
         msg_groups = group_messages_by_album(new_messages)
 

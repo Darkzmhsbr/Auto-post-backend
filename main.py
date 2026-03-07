@@ -13,7 +13,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
-from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination, engine, Base
+from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination, AutopostAdmin, AutopostTopicMap, engine, Base
 from engine import start_engine, stop_engine, get_engine_status
 
 init_db()
@@ -62,6 +62,16 @@ def get_db():
         yield db
     finally:
         db.close()
+
+def require_superadmin(user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Verifica se o usuário é super admin"""
+    admin = db.query(AutopostAdmin).filter(
+        AutopostAdmin.user_id == user_id,
+        AutopostAdmin.role == "superadmin"
+    ).first()
+    if not admin:
+        raise HTTPException(status_code=403, detail="Acesso negado: privilégios de super admin necessários.")
+    return user_id
 
 # ==========================================
 # MODELOS DE DADOS (Pydantic)
@@ -123,6 +133,8 @@ class ChannelCreate(BaseModel):
     custom_caption: Optional[str] = None
     use_custom_caption: Optional[bool] = False
     caption_mode: Optional[str] = "replace"
+    caption_keep_title: Optional[bool] = False   # Mantém título original
+    userbot_required: Optional[bool] = True      # False = só bot, sem userbot
     extra_destinations: Optional[List[DestinationCreate]] = None
 
 # Modelo para edição (todos campos opcionais)
@@ -143,6 +155,8 @@ class ChannelUpdate(BaseModel):
     custom_caption: Optional[str] = None
     use_custom_caption: Optional[bool] = None
     caption_mode: Optional[str] = None
+    caption_keep_title: Optional[bool] = None
+    userbot_required: Optional[bool] = None
 
 class ChannelResponse(BaseModel):
     id: int
@@ -164,6 +178,8 @@ class ChannelResponse(BaseModel):
     custom_caption: Optional[str] = None
     use_custom_caption: Optional[bool] = False
     caption_mode: Optional[str] = "replace"
+    caption_keep_title: Optional[bool] = False
+    userbot_required: Optional[bool] = True
     is_active: bool
     total_forwarded: int
     destinations: Optional[List[DestinationResponse]] = []
@@ -311,6 +327,8 @@ def _serialize_channel(canal, db):
         "custom_caption": canal.custom_caption,
         "use_custom_caption": canal.use_custom_caption or False,
         "caption_mode": canal.caption_mode or "replace",
+        "caption_keep_title": getattr(canal, 'caption_keep_title', False) or False,
+        "userbot_required": getattr(canal, 'userbot_required', True) if getattr(canal, 'userbot_required', None) is not None else True,
         "is_active": canal.is_active,
         "total_forwarded": canal.total_forwarded or 0,
         "destinations": [],
@@ -371,6 +389,8 @@ def create_channel(canal: ChannelCreate, user_id: str = Depends(get_current_user
         custom_caption=canal.custom_caption,
         use_custom_caption=canal.use_custom_caption or False,
         caption_mode=canal.caption_mode or "replace",
+        caption_keep_title=canal.caption_keep_title or False,
+        userbot_required=canal.userbot_required if canal.userbot_required is not None else True,
     )
     db.add(novo_canal)
     db.commit()
@@ -668,10 +688,163 @@ def clear_logs(user_id: str = Depends(get_current_user), db: Session = Depends(g
     db.query(AutopostLog).filter(AutopostLog.user_id == user_id).delete()
     db.commit()
     return {"message": "Histórico limpo com sucesso!"}
-    
 
 # ==========================================
-# 8. ROTA DE MIGRAÇÃO (Acessar via URL para aplicar novas colunas)
+# 8. SUPER ADMIN - PAINEL DE CONTROLE TOTAL
+# ==========================================
+
+@app.get("/api/admin/check")
+def check_admin(user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Verifica se o usuário é super admin"""
+    admin = db.query(AutopostAdmin).filter(AutopostAdmin.user_id == user_id).first()
+    return {"is_admin": admin is not None, "role": admin.role if admin else None}
+
+@app.get("/api/admin/stats")
+def admin_stats(user_id: str = Depends(require_superadmin), db: Session = Depends(get_db)):
+    """Estatísticas globais do sistema — apenas super admin"""
+    total_users = db.query(AutopostSession).count()
+    active_sessions = db.query(AutopostSession).filter(AutopostSession.is_active == True).count()
+    total_channels = db.query(AutopostChannel).count()
+    active_channels = db.query(AutopostChannel).filter(AutopostChannel.is_active == True).count()
+    total_bots = db.query(AutopostBot).count()
+    total_queue = db.query(AutopostQueue).count()
+    total_sent = db.query(AutopostQueue).filter(AutopostQueue.status == "sent").count()
+    total_errors = db.query(AutopostQueue).filter(AutopostQueue.status == "error").count()
+    total_destinations = db.query(AutopostDestination).count()
+    
+    return {
+        "users": {"total": total_users, "active_sessions": active_sessions},
+        "channels": {"total": total_channels, "active": active_channels},
+        "bots": {"total": total_bots},
+        "queue": {"total": total_queue, "sent": total_sent, "errors": total_errors},
+        "destinations": {"total": total_destinations},
+        "engine": get_engine_status()
+    }
+
+@app.get("/api/admin/users")
+def admin_list_users(user_id: str = Depends(require_superadmin), db: Session = Depends(get_db)):
+    """Lista todos os usuários com sessões e seus canais"""
+    sessions = db.query(AutopostSession).all()
+    result = []
+    for s in sessions:
+        channels = db.query(AutopostChannel).filter(AutopostChannel.user_id == s.user_id).all()
+        bots = db.query(AutopostBot).filter(AutopostBot.user_id == s.user_id).all()
+        total_sent = 0
+        for ch in channels:
+            total_sent += db.query(AutopostQueue).filter(
+                AutopostQueue.channel_pair_id == ch.id,
+                AutopostQueue.status == "sent"
+            ).count()
+        
+        result.append({
+            "user_id": s.user_id,
+            "phone": s.phone_number,
+            "is_active": s.is_active,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "total_channels": len(channels),
+            "active_channels": sum(1 for c in channels if c.is_active),
+            "total_bots": len(bots),
+            "total_sent": total_sent,
+        })
+    return result
+
+@app.get("/api/admin/users/{target_user_id}/channels")
+def admin_user_channels(target_user_id: str, user_id: str = Depends(require_superadmin), db: Session = Depends(get_db)):
+    """Lista canais de um usuário específico — super admin"""
+    canais = db.query(AutopostChannel).filter(AutopostChannel.user_id == target_user_id).all()
+    return [_serialize_channel(c, db) for c in canais]
+
+@app.post("/api/admin/users/{target_user_id}/toggle")
+def admin_toggle_user(target_user_id: str, user_id: str = Depends(require_superadmin), db: Session = Depends(get_db)):
+    """Ativa/desativa sessão de um usuário — super admin"""
+    session = db.query(AutopostSession).filter(AutopostSession.user_id == target_user_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+    session.is_active = not session.is_active
+    if not session.is_active:
+        # Pausa todos os canais do usuário
+        db.query(AutopostChannel).filter(AutopostChannel.user_id == target_user_id).update({"is_active": False})
+    db.commit()
+    return {"message": f"Usuário {'ativado' if session.is_active else 'desativado'}!", "is_active": session.is_active}
+
+@app.delete("/api/admin/users/{target_user_id}")
+def admin_delete_user(target_user_id: str, user_id: str = Depends(require_superadmin), db: Session = Depends(get_db)):
+    """Remove um usuário e todos os seus dados — super admin"""
+    session = db.query(AutopostSession).filter(AutopostSession.user_id == target_user_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+    # Deleta em cascata: channels → destinations, queue
+    channels = db.query(AutopostChannel).filter(AutopostChannel.user_id == target_user_id).all()
+    for ch in channels:
+        db.query(AutopostDestination).filter(AutopostDestination.channel_id == ch.id).delete()
+        db.query(AutopostQueue).filter(AutopostQueue.channel_pair_id == ch.id).delete()
+        db.query(AutopostTopicMap).filter(AutopostTopicMap.channel_id == ch.id).delete()
+    db.query(AutopostChannel).filter(AutopostChannel.user_id == target_user_id).delete()
+    db.query(AutopostBot).filter(AutopostBot.user_id == target_user_id).delete()
+    db.query(AutopostLog).filter(AutopostLog.user_id == target_user_id).delete()
+    db.delete(session)
+    db.commit()
+    return {"message": f"Usuário {target_user_id} removido com sucesso!"}
+
+@app.post("/api/admin/promote/{target_user_id}")
+def admin_promote(target_user_id: str, user_id: str = Depends(require_superadmin), db: Session = Depends(get_db)):
+    """Promove um usuário a admin"""
+    existing = db.query(AutopostAdmin).filter(AutopostAdmin.user_id == target_user_id).first()
+    if existing:
+        return {"message": "Usuário já é admin."}
+    new_admin = AutopostAdmin(user_id=target_user_id, role="admin")
+    db.add(new_admin)
+    db.commit()
+    return {"message": f"Usuário {target_user_id} promovido a admin!"}
+
+@app.delete("/api/admin/demote/{target_user_id}")
+def admin_demote(target_user_id: str, user_id: str = Depends(require_superadmin), db: Session = Depends(get_db)):
+    """Remove admin de um usuário"""
+    admin = db.query(AutopostAdmin).filter(AutopostAdmin.user_id == target_user_id).first()
+    if not admin:
+        raise HTTPException(status_code=404, detail="Usuário não é admin.")
+    if admin.role == "superadmin":
+        raise HTTPException(status_code=400, detail="Não é possível rebaixar um super admin.")
+    db.delete(admin)
+    db.commit()
+    return {"message": f"Admin removido de {target_user_id}!"}
+
+# Rota para mapeamento de tópicos
+@app.get("/api/autopost/channels/{channel_id}/topics")
+def list_topic_maps(channel_id: int, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    canal = db.query(AutopostChannel).filter(AutopostChannel.id == channel_id, AutopostChannel.user_id == user_id).first()
+    if not canal:
+        raise HTTPException(status_code=404, detail="Canal não encontrado.")
+    topics = db.query(AutopostTopicMap).filter(AutopostTopicMap.channel_id == channel_id).all()
+    return [{"id": t.id, "origin_topic_id": t.origin_topic_id, "origin_topic_name": t.origin_topic_name, "dest_topic_id": t.dest_topic_id, "dest_topic_name": t.dest_topic_name, "is_active": t.is_active} for t in topics]
+
+@app.post("/api/autopost/channels/{channel_id}/topics")
+def add_topic_map(channel_id: int, body: dict, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    canal = db.query(AutopostChannel).filter(AutopostChannel.id == channel_id, AutopostChannel.user_id == user_id).first()
+    if not canal:
+        raise HTTPException(status_code=404, detail="Canal não encontrado.")
+    new_map = AutopostTopicMap(
+        channel_id=channel_id,
+        origin_topic_id=body.get("origin_topic_id"),
+        origin_topic_name=body.get("origin_topic_name", ""),
+        dest_topic_id=body.get("dest_topic_id"),
+        dest_topic_name=body.get("dest_topic_name", ""),
+    )
+    db.add(new_map)
+    db.commit()
+    return {"id": new_map.id, "message": "Mapeamento de tópico criado!"}
+
+@app.delete("/api/autopost/channels/{channel_id}/topics/{topic_id}")
+def remove_topic_map(channel_id: int, topic_id: int, user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    t = db.query(AutopostTopicMap).filter(AutopostTopicMap.id == topic_id, AutopostTopicMap.channel_id == channel_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Mapeamento não encontrado.")
+    db.delete(t)
+    db.commit()
+    return {"message": "Mapeamento removido!"}
+
+# ==========================================
+# 9. ROTA DE MIGRAÇÃO (Acessar via URL para aplicar novas colunas)
 # ==========================================
 @app.get("/api/migrate")
 def run_migration(db: Session = Depends(get_db)):
@@ -709,6 +882,8 @@ def run_migration(db: Session = Depends(get_db)):
             "use_custom_caption": "BOOLEAN DEFAULT FALSE",
             "caption_mode": "VARCHAR DEFAULT 'replace'",
             "cta_mode": "VARCHAR DEFAULT 'exact'",
+            "caption_keep_title": "BOOLEAN DEFAULT FALSE",
+            "userbot_required": "BOOLEAN DEFAULT TRUE",
         }
         
         for col_name, col_def in new_columns.items():
@@ -726,8 +901,39 @@ def run_migration(db: Session = Depends(get_db)):
         else:
             results.append("ℹ️ Tabela 'autopost_destinations' já existe.")
         
+        # 4. Cria tabela autopost_admins se não existir
+        if "autopost_admins" not in existing_tables:
+            Base.metadata.tables["autopost_admins"].create(bind=engine)
+            results.append("✅ Tabela 'autopost_admins' criada!")
+        else:
+            results.append("ℹ️ Tabela 'autopost_admins' já existe.")
+        
+        # 5. Cria tabela autopost_topic_maps se não existir
+        if "autopost_topic_maps" not in existing_tables:
+            Base.metadata.tables["autopost_topic_maps"].create(bind=engine)
+            results.append("✅ Tabela 'autopost_topic_maps' criada!")
+        else:
+            results.append("ℹ️ Tabela 'autopost_topic_maps' já existe.")
+        
         return {"status": "success", "migrations": results}
     
     except Exception as e:
         db.rollback()
         return {"status": "error", "detail": str(e), "migrations": results}
+
+@app.get("/api/setup-admin/{target_user_id}")
+def setup_first_admin(target_user_id: str, db: Session = Depends(get_db)):
+    """
+    Rota de setup ÚNICA para criar o primeiro super admin.
+    Acesse: https://api-autopost.zenyxvips.com/api/setup-admin/Stifler
+    
+    Depois de usar, essa rota não cria duplicatas.
+    """
+    existing = db.query(AutopostAdmin).filter(AutopostAdmin.user_id == target_user_id).first()
+    if existing:
+        return {"message": f"Usuário {target_user_id} já é {existing.role}."}
+    
+    new_admin = AutopostAdmin(user_id=target_user_id, role="superadmin")
+    db.add(new_admin)
+    db.commit()
+    return {"message": f"🎉 {target_user_id} agora é SUPER ADMIN do AutoPost!"}

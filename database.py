@@ -78,7 +78,10 @@ class AutopostChannel(Base):
     # 👇 NOVOS: Legenda personalizada com formatação HTML/Telegram
     custom_caption = Column(Text, nullable=True)       # Legenda HTML personalizada
     use_custom_caption = Column(Boolean, default=False) # Toggle ativar/desativar
-    caption_mode = Column(String, default="replace")    # "replace" ou "append"
+    caption_mode = Column(String, default="replace")    # "replace", "append" ou "smart"
+    # "smart" = manter título original + substituir corpo + CTA
+    caption_keep_title = Column(Boolean, default=False)  # Mantém o título da postagem original
+    userbot_required = Column(Boolean, default=True)     # False = funciona só com bot, sem userbot
     is_active = Column(Boolean, default=True)
     last_post_id = Column(Integer, default=0)
     total_forwarded = Column(Integer, default=0)
@@ -122,6 +125,30 @@ class AutopostLog(Base):
     action = Column(String) 
     details = Column(JSONB, nullable=True)
     created_at = Column(DateTime, default=now_brazil)
+
+# 👇 NOVA TABELA: SUPER ADMINS DO AUTOPOST 👇
+class AutopostAdmin(Base):
+    __tablename__ = "autopost_admins"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, nullable=False, unique=True, index=True)  # Mesmo user_id do SSO
+    role = Column(String, default="admin")  # "superadmin" ou "admin"
+    created_at = Column(DateTime, default=now_brazil)
+
+# 👇 NOVA TABELA: MAPEAMENTO DE TÓPICOS (Origem → Destino) 👇
+class AutopostTopicMap(Base):
+    __tablename__ = "autopost_topic_maps"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    channel_id = Column(Integer, ForeignKey("autopost_channels_v2.id"), nullable=False)
+    origin_topic_id = Column(BigInteger, nullable=False)   # ID do tópico no canal de origem
+    origin_topic_name = Column(String)
+    dest_topic_id = Column(BigInteger, nullable=False)     # ID do tópico correspondente no destino
+    dest_topic_name = Column(String)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=now_brazil)
+    
+    channel = relationship("AutopostChannel", backref="topic_maps")
 
 def init_db():
     Base.metadata.create_all(bind=engine)
