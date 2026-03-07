@@ -18,6 +18,7 @@ from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument,
     MessageMediaWebPage, MessageMediaContact
 )
+from telethon.extensions import html  # 👇 NOVO: Importando a extensão HTML para preservar emojis e formatação
 
 from database import SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination
 
@@ -260,7 +261,14 @@ async def process_clone(userbot, channel, msg_group, db):
             for msg in msg_group:
                 if msg.media:
                     media_files.append(msg.media)
-                msg_text = msg.text or msg.message or ''
+                
+                # 👇 ATUALIZAÇÃO: Extraindo texto como HTML para manter emojis Premium e formatações
+                raw_text = msg.message or ''
+                if raw_text and getattr(msg, 'entities', None):
+                    msg_text = html.unparse(raw_text, msg.entities)
+                else:
+                    msg_text = raw_text
+
                 if msg_text and album_caption is None:
                     album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace)
             
@@ -276,7 +284,8 @@ async def process_clone(userbot, channel, msg_group, db):
                     await dest_client.send_file(
                         dest["dest_channel_id"],
                         file=media_files,
-                        caption=album_caption if album_caption else None
+                        caption=album_caption if album_caption else None,
+                        parse_mode='html' # 👇 ATUALIZAÇÃO: Avisando o Telegram que tem formatação
                     )
                     logger.info(f"CLONE ÁLBUM | Canal {channel.id} | {len(media_files)} mídias → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
                 except Exception as e:
@@ -294,7 +303,13 @@ async def process_clone(userbot, channel, msg_group, db):
 
         else:
             msg = first_msg
-            text = msg.text or msg.message or ''
+            # 👇 ATUALIZAÇÃO: Extraindo texto como HTML para manter emojis Premium
+            raw_text = msg.message or ''
+            if raw_text and getattr(msg, 'entities', None):
+                text = html.unparse(raw_text, msg.entities)
+            else:
+                text = raw_text
+
             text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace)
             text = apply_custom_caption(text, channel)
             media_type = "text"
@@ -310,9 +325,9 @@ async def process_clone(userbot, channel, msg_group, db):
             for dest in all_destinations:
                 try:
                     if msg.media:
-                        await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=msg.media)
+                        await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=msg.media, parse_mode='html') # 👇 ATUALIZAÇÃO: parse_mode='html'
                     elif text:
-                        await dest_client.send_message(dest["dest_channel_id"], message=text)
+                        await dest_client.send_message(dest["dest_channel_id"], message=text, parse_mode='html') # 👇 ATUALIZAÇÃO: parse_mode='html'
                     else:
                         continue
                     logger.info(f"CLONE | Canal {channel.id} | msg {msg.id} → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
@@ -429,7 +444,14 @@ async def process_spy(userbot, channel, msg_group, db):
             for msg in msg_group:
                 if msg.media:
                     media_files.append(msg.media)
-                msg_text = msg.text or msg.message or ''
+                
+                # 👇 ATUALIZAÇÃO: Extraindo texto como HTML para ponte
+                raw_text = msg.message or ''
+                if raw_text and getattr(msg, 'entities', None):
+                    msg_text = html.unparse(raw_text, msg.entities)
+                else:
+                    msg_text = raw_text
+
                 if msg_text and album_caption is None:
                     album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace)
             
@@ -438,7 +460,7 @@ async def process_spy(userbot, channel, msg_group, db):
                 return None
 
             # PASSO 1: Userbot envia álbum pro Canal Oculto
-            bridge_msgs = await userbot.send_file(bridge_channel_id, file=media_files, caption=album_caption if album_caption else None)
+            bridge_msgs = await userbot.send_file(bridge_channel_id, file=media_files, caption=album_caption if album_caption else None, parse_mode='html') # 👇 ATUALIZAÇÃO
             await asyncio.sleep(1.5)
 
             if isinstance(bridge_msgs, list):
@@ -459,14 +481,20 @@ async def process_spy(userbot, channel, msg_group, db):
 
         else:
             msg = first_msg
-            text = msg.text or msg.message or ''
+            # 👇 ATUALIZAÇÃO: Extraindo HTML para ponte única
+            raw_text = msg.message or ''
+            if raw_text and getattr(msg, 'entities', None):
+                text = html.unparse(raw_text, msg.entities)
+            else:
+                text = raw_text
+
             text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace)
             text = apply_custom_caption(text, channel)
 
             if msg.media:
-                bridge_msg = await userbot.send_message(bridge_channel_id, message=text if text else None, file=msg.media)
+                bridge_msg = await userbot.send_message(bridge_channel_id, message=text if text else None, file=msg.media, parse_mode='html') # 👇 ATUALIZAÇÃO
             elif text:
-                bridge_msg = await userbot.send_message(bridge_channel_id, message=text)
+                bridge_msg = await userbot.send_message(bridge_channel_id, message=text, parse_mode='html') # 👇 ATUALIZAÇÃO
             else:
                 return None
 
