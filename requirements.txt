@@ -3,3 +3,7 @@ uvicorn
 sqlalchemy
 psycopg2-binary
 pydantic
+python-jose[cryptography]
+telethon
+apscheduler
+python-dotenv
