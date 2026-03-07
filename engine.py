@@ -359,21 +359,8 @@ async def process_clone(userbot, channel, msg_group, db):
 
     try:
         if is_album:
-            media_files = []
             album_caption = None
             for msg in msg_group:
-                if msg.media:
-                    try:
-                        path = await userbot.download_media(msg.media)
-                        if path:
-                            media_files.append(path)
-                            downloaded_paths.append(path)
-                        else:
-                            media_files.append(msg.media)
-                    except Exception as e:
-                        logger.error(f"Erro ao baixar mídia do álbum (pode falhar se protegido): {e}")
-                        media_files.append(msg.media)
-                
                 raw_text = msg.message or ''
                 if raw_text and getattr(msg, 'entities', None):
                     msg_text = html.unparse(raw_text, msg.entities)
@@ -384,28 +371,59 @@ async def process_clone(userbot, channel, msg_group, db):
                     album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
             
             album_caption = apply_custom_caption(album_caption, channel)
-            
-            if not media_files:
-                return None
+            must_download = (dest_client != userbot)
             
             for dest in all_destinations:
                 reply_to_id = dest_topic_ids.get(dest["dest_channel_id"])
-                try:
-                    await dest_client.send_file(
-                        dest["dest_channel_id"],
-                        file=media_files,
-                        caption=album_caption if album_caption else None,
-                        parse_mode='html',
-                        reply_to=reply_to_id
-                    )
-                    logger.info(f"CLONE ÁLBUM | Canal {channel.id} | {len(media_files)} mídias → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
-                except Exception as e:
-                    logger.error(f"CLONE ÁLBUM ERRO | destino {dest['dest_channel_id']}: {e}")
+                success = False
+                
+                # Tenta enviar nativamente (instantâneo e preserva o álbum perfeito)
+                if not must_download:
+                    try:
+                        native_media = [m.media for m in msg_group if m.media]
+                        if native_media:
+                            await dest_client.send_file(
+                                dest["dest_channel_id"],
+                                file=native_media,
+                                caption=album_caption if album_caption else None,
+                                parse_mode='html',
+                                reply_to=reply_to_id
+                            )
+                            logger.info(f"CLONE ÁLBUM NATIVO | Canal {channel.id} → {dest['dest_channel_name']}")
+                            success = True
+                    except Exception as e:
+                        logger.warning(f"Falha no clone nativo (canal protegido?), ativando fallback de download: {e}")
+                        must_download = True
+                
+                # Se falhou ou precisa baixar, executa o download lento
+                if must_download and not success:
+                    if not downloaded_paths:
+                        for m in msg_group:
+                            if m.media:
+                                try:
+                                    p = await userbot.download_media(m.media)
+                                    if p: downloaded_paths.append(p)
+                                except Exception as dl_err:
+                                    logger.error(f"Erro no download: {dl_err}")
+                    
+                    if downloaded_paths:
+                        try:
+                            await dest_client.send_file(
+                                dest["dest_channel_id"],
+                                file=downloaded_paths,
+                                caption=album_caption if album_caption else None,
+                                parse_mode='html',
+                                reply_to=reply_to_id
+                            )
+                            logger.info(f"CLONE ÁLBUM DOWNLOAD | Canal {channel.id} → {dest['dest_channel_name']}")
+                        except Exception as e:
+                            logger.error(f"CLONE ÁLBUM ERRO | {dest['dest_channel_name']}: {e}")
+                
                 await asyncio.sleep(0.5)
             
             queue_entry = create_queue_entry(
-                db, channel.id, first_msg.id, f"album_{len(media_files)}",
-                {"text_preview": (album_caption or "")[:200], "mode": "clone", "album_size": len(media_files), "msg_ids": msg_ids, "destinations": len(all_destinations)},
+                db, channel.id, first_msg.id, f"album_{len(msg_group)}",
+                {"text_preview": (album_caption or "")[:200], "mode": "clone", "album_size": len(msg_group), "msg_ids": msg_ids, "destinations": len(all_destinations)},
                 status="sent"
             )
             queue_entry.sent_at = now_brazil()
@@ -424,35 +442,46 @@ async def process_clone(userbot, channel, msg_group, db):
             text = apply_custom_caption(text, channel)
             media_type = "text"
             
-            downloaded_file = None
-
             if msg.media:
-                if isinstance(msg.media, MessageMediaPhoto):
-                    media_type = "photo"
-                elif isinstance(msg.media, MessageMediaDocument):
-                    media_type = "document"
-                else:
-                    media_type = "other_media"
-                    
-                try:
-                    downloaded_file = await userbot.download_media(msg.media)
-                    if downloaded_file:
-                        downloaded_paths.append(downloaded_file)
-                except Exception as e:
-                    logger.error(f"Erro ao baixar mídia única: {e}")
+                if isinstance(msg.media, MessageMediaPhoto): media_type = "photo"
+                elif isinstance(msg.media, MessageMediaDocument): media_type = "document"
+                else: media_type = "other_media"
+
+            must_download = (dest_client != userbot)
 
             for dest in all_destinations:
                 reply_to_id = dest_topic_ids.get(dest["dest_channel_id"])
-                try:
-                    if msg.media:
-                        await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=downloaded_file or msg.media, parse_mode='html', reply_to=reply_to_id)
-                    elif text:
-                        await dest_client.send_message(dest["dest_channel_id"], message=text, parse_mode='html', reply_to=reply_to_id)
-                    else:
-                        continue
-                    logger.info(f"CLONE | Canal {channel.id} | msg {msg.id} → {dest['dest_channel_name']} ({dest['dest_channel_id']})")
-                except Exception as e:
-                    logger.error(f"CLONE ERRO | destino {dest['dest_channel_id']}: {e}")
+                success = False
+
+                if not must_download:
+                    try:
+                        if msg.media:
+                            await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=msg.media, parse_mode='html', reply_to=reply_to_id)
+                        elif text:
+                            await dest_client.send_message(dest["dest_channel_id"], message=text, parse_mode='html', reply_to=reply_to_id)
+                        logger.info(f"CLONE NATIVO | Canal {channel.id} → {dest['dest_channel_name']}")
+                        success = True
+                    except Exception as e:
+                        logger.warning(f"Falha nativa, ativando fallback de download: {e}")
+                        must_download = True
+
+                if must_download and not success:
+                    if msg.media and not downloaded_paths:
+                        try:
+                            path = await userbot.download_media(msg.media)
+                            if path: downloaded_paths.append(path)
+                        except Exception as e:
+                            logger.error(f"Erro ao baixar mídia única: {e}")
+
+                    try:
+                        if downloaded_paths:
+                            await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=downloaded_paths[0], parse_mode='html', reply_to=reply_to_id)
+                        elif text:
+                            await dest_client.send_message(dest["dest_channel_id"], message=text, parse_mode='html', reply_to=reply_to_id)
+                        logger.info(f"CLONE DOWNLOAD | Canal {channel.id} → {dest['dest_channel_name']}")
+                    except Exception as e:
+                        logger.error(f"CLONE ERRO | {dest['dest_channel_name']}: {e}")
+                
                 await asyncio.sleep(0.5)
 
             queue_entry = create_queue_entry(
@@ -562,21 +591,8 @@ async def process_spy(userbot, channel, msg_group, db):
 
     try:
         if is_album:
-            media_files = []
             album_caption = None
             for msg in msg_group:
-                if msg.media:
-                    try:
-                        path = await userbot.download_media(msg.media)
-                        if path:
-                            media_files.append(path)
-                            downloaded_paths.append(path)
-                        else:
-                            media_files.append(msg.media)
-                    except Exception as e:
-                        logger.error(f"Erro ao baixar mídia do álbum SPY: {e}")
-                        media_files.append(msg.media)
-                
                 raw_text = msg.message or ''
                 if raw_text and getattr(msg, 'entities', None):
                     msg_text = html.unparse(raw_text, msg.entities)
@@ -587,10 +603,28 @@ async def process_spy(userbot, channel, msg_group, db):
                     album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
             
             album_caption = apply_custom_caption(album_caption, channel)
-            if not media_files:
+            bridge_msgs = None
+            
+            try:
+                # Tenta mandar instantaneamente pro canal ponte
+                native_media = [m.media for m in msg_group if m.media]
+                if native_media:
+                    bridge_msgs = await userbot.send_file(bridge_channel_id, file=native_media, caption=album_caption if album_caption else None, parse_mode='html')
+            except Exception as e:
+                logger.warning(f"SPY ÁLBUM nativo falhou, baixando: {e}")
+                if not downloaded_paths:
+                    for m in msg_group:
+                        if m.media:
+                            try:
+                                p = await userbot.download_media(m.media)
+                                if p: downloaded_paths.append(p)
+                            except: pass
+                if downloaded_paths:
+                    bridge_msgs = await userbot.send_file(bridge_channel_id, file=downloaded_paths, caption=album_caption if album_caption else None, parse_mode='html')
+
+            if not bridge_msgs:
                 return None
 
-            bridge_msgs = await userbot.send_file(bridge_channel_id, file=media_files, caption=album_caption if album_caption else None, parse_mode='html')
             await asyncio.sleep(1.5)
 
             if isinstance(bridge_msgs, list):
@@ -607,7 +641,7 @@ async def process_spy(userbot, channel, msg_group, db):
                     logger.error(f"SPY ÁLBUM ERRO | destino {dest['dest_channel_id']}: {e}")
                 await asyncio.sleep(0.5)
 
-            media_type = f"spy_album_{len(media_files)}"
+            media_type = f"spy_album_{len(msg_group)}"
 
         else:
             msg = first_msg
@@ -619,21 +653,24 @@ async def process_spy(userbot, channel, msg_group, db):
 
             text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
             text = apply_custom_caption(text, channel)
-            
-            downloaded_file = None
-            if msg.media:
-                try:
-                    downloaded_file = await userbot.download_media(msg.media)
-                    if downloaded_file:
-                        downloaded_paths.append(downloaded_file)
-                except Exception as e:
-                    logger.error(f"Erro ao baixar mídia única SPY: {e}")
+            bridge_msg = None
 
-            if msg.media:
-                bridge_msg = await userbot.send_message(bridge_channel_id, message=text if text else None, file=downloaded_file or msg.media, parse_mode='html')
-            elif text:
-                bridge_msg = await userbot.send_message(bridge_channel_id, message=text, parse_mode='html')
-            else:
+            try:
+                if msg.media:
+                    bridge_msg = await userbot.send_message(bridge_channel_id, message=text if text else None, file=msg.media, parse_mode='html')
+                elif text:
+                    bridge_msg = await userbot.send_message(bridge_channel_id, message=text, parse_mode='html')
+            except Exception as e:
+                logger.warning(f"SPY nativo falhou, baixando: {e}")
+                if msg.media:
+                    try:
+                        p = await userbot.download_media(msg.media)
+                        if p: downloaded_paths.append(p)
+                    except: pass
+                if downloaded_paths:
+                    bridge_msg = await userbot.send_message(bridge_channel_id, message=text if text else None, file=downloaded_paths[0], parse_mode='html')
+
+            if not bridge_msg:
                 return None
 
             await asyncio.sleep(1)
@@ -857,7 +894,8 @@ def run_engine_tick():
     
     future = asyncio.run_coroutine_threadsafe(engine_tick(), _main_loop)
     try:
-        future.result(timeout=25)
+        # 👇 REMOVIDO O TIMEOUT! AGORA ELE ESPERA O DOWNLOAD TERMINAR PACIENTEMENTE
+        future.result() 
     except Exception as e:
         logger.error(f"Erro no engine tick: {e}")
 
