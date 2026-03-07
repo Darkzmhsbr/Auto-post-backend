@@ -647,26 +647,40 @@ async def engine_tick():
 
 
 def run_engine_tick():
-    """Wrapper síncrono para o APScheduler chamar a função async"""
+    """Wrapper síncrono para o APScheduler chamar a função async no loop correto"""
+    global _main_loop
+    
+    if _main_loop is None or _main_loop.is_closed():
+        logger.warning("Event loop principal não disponível. Pulando tick.")
+        return
+    
+    # Executa no loop do uvicorn (mesmo loop onde Telethon conectou)
+    future = asyncio.run_coroutine_threadsafe(engine_tick(), _main_loop)
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(engine_tick())
-        else:
-            loop.run_until_complete(engine_tick())
-    except RuntimeError:
-        asyncio.run(engine_tick())
+        # Aguarda até 55 segundos (antes do próximo tick de 60s)
+        future.result(timeout=55)
+    except Exception as e:
+        logger.error(f"Erro no engine tick: {e}")
 
 
 # ==========================================
 # STARTUP / SHUTDOWN
 # ==========================================
 _scheduler = None
+_main_loop = None  # Referência ao event loop do uvicorn
 
 
 def start_engine():
     """Inicia o APScheduler com o engine_tick rodando a cada 60 segundos"""
-    global _scheduler
+    global _scheduler, _main_loop
+
+    # Captura o event loop do uvicorn/FastAPI
+    try:
+        _main_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _main_loop = asyncio.get_event_loop()
+    
+    logger.info(f"Event loop capturado: {_main_loop}")
 
     from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -687,31 +701,34 @@ def start_engine():
 
 def stop_engine():
     """Para o APScheduler graciosamente"""
-    global _scheduler
+    global _scheduler, _main_loop
 
     if _scheduler:
         _scheduler.shutdown(wait=False)
         logger.info("🛑 AutoPost Engine parado.")
 
     async def _disconnect_all():
-        for uid, client in _userbot_clients.items():
+        for uid, client in list(_userbot_clients.items()):
             try:
                 await client.disconnect()
             except Exception:
                 pass
-        for token, client in _bot_clients.items():
+        for token, client in list(_bot_clients.items()):
             try:
                 await client.disconnect()
             except Exception:
                 pass
 
-    try:
-        asyncio.run(_disconnect_all())
-    except Exception:
-        pass
-
+    # Tenta desconectar no loop principal
+    if _main_loop and not _main_loop.is_closed():
+        try:
+            asyncio.run_coroutine_threadsafe(_disconnect_all(), _main_loop)
+        except Exception:
+            pass
+    
     _userbot_clients.clear()
     _bot_clients.clear()
+    _main_loop = None
 
 
 # ==========================================

@@ -21,11 +21,11 @@ app = FastAPI(title="Zenyx AutoPost API", version="1.0")
 
 # Inicia e para o Engine junto com o FastAPI
 @app.on_event("startup")
-def on_startup():
-    start_engine()
+async def on_startup():
+    start_engine()  # Captura o event loop do uvicorn aqui
 
 @app.on_event("shutdown")
-def on_shutdown():
+async def on_shutdown():
     stop_engine()
 
 app.add_middleware(
