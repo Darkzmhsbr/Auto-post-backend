@@ -311,7 +311,7 @@ async def process_clone(userbot, channel, msg_group, db):
                     msg_text = raw_text
 
                 if msg_text and album_caption is None:
-                    album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace, channel.cta_mode)
+                    album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
             
             album_caption = apply_custom_caption(album_caption, channel)
             
@@ -348,7 +348,7 @@ async def process_clone(userbot, channel, msg_group, db):
             else:
                 text = raw_text
 
-            text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace, channel.cta_mode)
+            text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
             text = apply_custom_caption(text, channel)
             media_type = "text"
             
@@ -519,7 +519,7 @@ async def process_spy(userbot, channel, msg_group, db):
                     msg_text = raw_text
 
                 if msg_text and album_caption is None:
-                    album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace, channel.cta_mode)
+                    album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
             
             album_caption = apply_custom_caption(album_caption, channel)
             if not media_files:
@@ -553,7 +553,7 @@ async def process_spy(userbot, channel, msg_group, db):
             else:
                 text = raw_text
 
-            text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace, channel.cta_mode)
+            text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
             text = apply_custom_caption(text, channel)
             
             downloaded_file = None
@@ -592,7 +592,7 @@ async def process_spy(userbot, channel, msg_group, db):
         for m in msg_group:
             t = m.text or m.message or ''
             if t:
-                text_preview = apply_cta_replacement(t, channel.cta_find, channel.cta_replace, channel.cta_mode)[:200]
+                text_preview = apply_cta_replacement(t, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))[:200]
                 break
 
         queue_entry = create_queue_entry(
@@ -639,7 +639,26 @@ async def process_channel(channel, session_record, db):
     ).order_by(AutopostQueue.id.desc()).first()
 
     if last_sent and last_sent.sent_at:
-        elapsed = (now_brazil() - last_sent.sent_at.replace(tzinfo=BRAZIL_TZ) if last_sent.sent_at.tzinfo is None else now_brazil() - last_sent.sent_at).total_seconds()
+        last_dt = last_sent.sent_at
+        
+        # 👇 ATUALIZAÇÃO 1: Correção definitiva do fuso horário para garantir que o intervalo avance
+        if last_dt.tzinfo is None:
+            # Pegamos o tempo decorrido considerando que o banco salvou como Local ou como UTC
+            elapsed_local = (now_brazil().replace(tzinfo=None) - last_dt).total_seconds()
+            elapsed_utc = (datetime.utcnow() - last_dt).total_seconds()
+            
+            # Escolhemos o cenário correto (tem que ser positivo e coerente)
+            if elapsed_local >= 0 and elapsed_utc >= 0:
+                elapsed = min(elapsed_local, elapsed_utc)
+            elif elapsed_utc >= 0:
+                elapsed = elapsed_utc
+            elif elapsed_local >= 0:
+                elapsed = elapsed_local
+            else:
+                elapsed = abs(elapsed_local) # Fallback extremo para evitar travar no negativo
+        else:
+            elapsed = (now_brazil() - last_dt).total_seconds()
+
         interval_seconds = (channel.interval_minutes or 5) * 60
         if elapsed < interval_seconds:
             return 0  # Ainda não deu tempo, espera o próximo tick
@@ -692,10 +711,14 @@ async def process_channel(channel, session_record, db):
         else:
             result = await process_clone(userbot, channel, group, db)
 
+        # 👇 ATUALIZAÇÃO 2: Sempre avançamos o ID do canal! 
+        # Isso evita que a automação fique tentando clonar a mesma mensagem defeituosa eternamente (loop infinito)
+        group_max_id = max(m.id for m in group)
+        if group_max_id > (channel.last_post_id or 0):
+            channel.last_post_id = group_max_id
+            db.commit()
+
         if result:
-            group_max_id = max(m.id for m in group)
-            if group_max_id > (channel.last_post_id or 0):
-                channel.last_post_id = group_max_id
             channel.total_forwarded = (channel.total_forwarded or 0) + 1
             db.commit()
 
@@ -710,8 +733,8 @@ async def process_channel(channel, session_record, db):
                 "remaining": len(msg_groups) - 1
             })
             return 1
-
-        return 0
+            
+        return 0 # Caso result seja None (deu erro no envio da mensagem, mas o ID foi avançado)
 
     except Exception as e:
         logger.error(f"Erro ao processar canal {channel.id}: {e}")
