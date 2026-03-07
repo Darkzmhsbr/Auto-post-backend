@@ -8,3 +8,4 @@ telethon
 apscheduler
 python-dotenv
 pytz
+httpx
