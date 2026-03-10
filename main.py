@@ -849,6 +849,37 @@ def remove_topic_map(channel_id: int, topic_id: int, user_id: str = Depends(get_
     return {"message": "Mapeamento removido!"}
 
 # ==========================================
+# CLONEX — STATUS E CONFIGURAÇÃO
+# ==========================================
+
+@app.get("/api/clonex/status")
+def clonex_status(user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Retorna o status dos módulos Clonex para o usuário.
+    - Clonex Prévias: sempre liberado
+    - Clonex VIPs: bloqueado (exceto admin/superadmin)
+    """
+    admin = db.query(AutopostAdmin).filter(AutopostAdmin.user_id == user_id).first()
+    is_admin = admin is not None
+    
+    return {
+        "clonex_previas": {
+            "unlocked": True,
+            "label": "Clonex Prévias",
+            "description": "Clone canais e grupos de prévias (seus ou de concorrentes). Limite: mídias até 50MB.",
+            "max_media_mb": 50,
+        },
+        "clonex_vips": {
+            "unlocked": is_admin,  # Só admin tem acesso
+            "label": "Clonex VIPs",
+            "description": "Clone canais VIPs completos sem limite de tamanho. Requer migração do backend para VPS dedicada.",
+            "max_media_mb": None if is_admin else 50,
+            "blocked_reason": None if is_admin else "Recurso será liberado após migração do backend para VPS dedicada (Contabo/Hetzner).",
+        },
+        "is_admin": is_admin,
+    }
+
+# ==========================================
 # 9. ROTA DE MIGRAÇÃO (Acessar via URL para aplicar novas colunas)
 # ==========================================
 @app.get("/api/migrate")
@@ -863,6 +894,7 @@ def run_migration(db: Session = Depends(get_db)):
     - Tabela autopost_destinations (múltiplos destinos)
     - Colunas custom_caption, use_custom_caption, caption_mode em autopost_channels_v2
     - Coluna auto_topic_clone
+    - [CLONEX] Limite de 50MB aplicado no engine (sem alteração de schema)
     """
     from sqlalchemy import text, inspect
     

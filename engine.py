@@ -34,6 +34,7 @@ from database import SessionLocal, AutopostChannel, AutopostSession, AutopostBot
 # CONFIGURAÇÃO
 # ==========================================
 BRAZIL_TZ = timezone('America/Sao_Paulo')
+MAX_MEDIA_SIZE_BYTES = 50 * 1024 * 1024  # 50MB — Limite máximo de mídia para clonagem (Clonex)
 logger = logging.getLogger("autopost_engine")
 logger.setLevel(logging.INFO)
 
@@ -149,6 +150,41 @@ def create_queue_entry(db, channel_pair_id, origin_msg_id, media_type, content_j
     db.add(entry)
     db.commit()
     return entry
+
+
+def check_media_size(msg):
+    """
+    Verifica se a mídia de uma mensagem excede o limite de 50MB (Clonex).
+    Retorna True se a mídia for ACEITÁVEL (abaixo do limite ou sem mídia).
+    Retorna False se exceder o limite.
+    """
+    if not msg.media:
+        return True  # Sem mídia = OK
+    
+    # MessageMediaDocument tem o atributo document.size
+    if isinstance(msg.media, MessageMediaDocument):
+        doc = getattr(msg.media, 'document', None)
+        if doc:
+            file_size = getattr(doc, 'size', 0) or 0
+            if file_size > MAX_MEDIA_SIZE_BYTES:
+                size_mb = file_size / (1024 * 1024)
+                logger.warning(f"⛔ MÍDIA EXCEDE 50MB ({size_mb:.1f}MB) | msg_id={msg.id} — Pulando.")
+                return False
+    
+    # MessageMediaPhoto geralmente é pequena, mas checamos por segurança
+    if isinstance(msg.media, MessageMediaPhoto):
+        photo = getattr(msg.media, 'photo', None)
+        if photo:
+            # Fotos usam photo.sizes — pegamos o maior tamanho disponível
+            sizes = getattr(photo, 'sizes', [])
+            for s in sizes:
+                file_size = getattr(s, 'size', 0) or 0
+                if file_size > MAX_MEDIA_SIZE_BYTES:
+                    size_mb = file_size / (1024 * 1024)
+                    logger.warning(f"⛔ FOTO EXCEDE 50MB ({size_mb:.1f}MB) | msg_id={msg.id} — Pulando.")
+                    return False
+    
+    return True  # Dentro do limite
 
 
 def group_messages_by_album(messages):
@@ -776,6 +812,27 @@ async def process_channel(channel, session_record, db):
             return 0
 
         new_messages = [m for m in messages if m.id > min_id and (m.message is not None or m.media is not None)]
+
+        if not new_messages:
+            return 0
+
+        # 👇 CLONEX: Filtra mídias que excedem 50MB
+        filtered_messages = []
+        for m in new_messages:
+            if check_media_size(m):
+                filtered_messages.append(m)
+            else:
+                # Avança o last_post_id para não tentar de novo
+                if m.id > (channel.last_post_id or 0):
+                    channel.last_post_id = m.id
+                    db.commit()
+                create_log(db, channel.user_id, "media_skipped_size", {
+                    "channel_id": channel.id,
+                    "msg_id": m.id,
+                    "reason": "Mídia excede limite de 50MB"
+                })
+        
+        new_messages = filtered_messages
 
         if not new_messages:
             return 0
