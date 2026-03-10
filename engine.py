@@ -17,7 +17,8 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument,
-    MessageMediaWebPage, MessageMediaContact
+    MessageMediaWebPage, MessageMediaContact,
+    MessageEntityCustomEmoji
 )
 from telethon.extensions import html  
 
@@ -104,6 +105,71 @@ def apply_custom_caption(original_text, channel):
         return (original_text or '') + separator + channel.custom_caption
     else:
         return channel.custom_caption
+
+
+def has_custom_emoji(entities):
+    """Verifica se a lista de entities contém emojis premium (custom emoji)."""
+    if not entities:
+        return False
+    return any(isinstance(e, MessageEntityCustomEmoji) for e in entities)
+
+
+def extract_text_and_entities(msg, channel):
+    """
+    Extrai texto e entities de uma mensagem de forma inteligente.
+    
+    Se a mensagem contém custom emojis (Premium), preserva as entities originais 
+    e aplica CTA/caption no texto puro (sem converter para HTML).
+    
+    Se NÃO contém custom emojis, usa html.unparse normalmente (comportamento legado).
+    
+    Retorna: (text, entities_list_or_None, use_html_parse_mode)
+      - Se entities_list_or_None é None → usar parse_mode='html'
+      - Se entities_list_or_None é lista → usar formatting_entities=... (sem parse_mode)
+    """
+    raw_text = msg.message or ''
+    entities = getattr(msg, 'entities', None) or []
+    
+    if not raw_text:
+        return '', None, True
+    
+    if has_custom_emoji(entities):
+        # 🌟 MODO PREMIUM EMOJI: preserva entities originais
+        # Aplica CTA no texto puro (sem HTML), mantém entities intactas
+        text = apply_cta_replacement(raw_text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
+        text = apply_custom_caption(text, channel)
+        
+        # Se o CTA mudou o tamanho do texto, as entities podem ficar desalinhadas.
+        # Se o texto NÃO mudou de tamanho, mantemos as entities perfeitas.
+        # Se mudou, fazemos fallback para HTML (perde custom emoji mas mantém formatação básica)
+        if len(text) == len(raw_text):
+            return text, list(entities), False
+        elif text == raw_text:
+            return text, list(entities), False
+        else:
+            # Texto mudou de tamanho por CTA/caption → entities desalinhadas
+            # Tenta preservar entities que ainda cabem no texto
+            adjusted_entities = []
+            for e in entities:
+                if e.offset + e.length <= len(text):
+                    adjusted_entities.append(e)
+            if adjusted_entities:
+                return text, adjusted_entities, False
+            # Nenhuma entity se encaixa → fallback HTML (perde custom emoji)
+            logger.warning(f"Custom emojis perdidos pois CTA alterou tamanho do texto (msg_id={msg.id})")
+            text_html = html.unparse(raw_text, entities)
+            text_html = apply_cta_replacement(text_html, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
+            text_html = apply_custom_caption(text_html, channel)
+            return text_html, None, True
+    else:
+        # Modo padrão: HTML (sem custom emoji)
+        if entities:
+            text = html.unparse(raw_text, entities)
+        else:
+            text = raw_text
+        text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
+        text = apply_custom_caption(text, channel)
+        return text, None, True
 
 
 def get_all_dest_channel_ids(channel, db):
@@ -396,17 +462,16 @@ async def process_clone(userbot, channel, msg_group, db):
     try:
         if is_album:
             album_caption = None
+            album_entities = None
+            album_use_html = True
             for msg in msg_group:
-                raw_text = msg.message or ''
-                if raw_text and getattr(msg, 'entities', None):
-                    msg_text = html.unparse(raw_text, msg.entities)
-                else:
-                    msg_text = raw_text
-
-                if msg_text and album_caption is None:
-                    album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
+                if album_caption is None:
+                    text, ents, use_html = extract_text_and_entities(msg, channel)
+                    if text:
+                        album_caption = text
+                        album_entities = ents
+                        album_use_html = use_html
             
-            album_caption = apply_custom_caption(album_caption, channel)
             must_download = (dest_client != userbot)
             
             for dest in all_destinations:
@@ -418,12 +483,18 @@ async def process_clone(userbot, channel, msg_group, db):
                     try:
                         native_media = [m.media for m in msg_group if m.media]
                         if native_media:
+                            send_kwargs = {
+                                "caption": album_caption if album_caption else None,
+                                "reply_to": reply_to_id
+                            }
+                            if album_entities and not album_use_html:
+                                send_kwargs["formatting_entities"] = album_entities
+                            else:
+                                send_kwargs["parse_mode"] = 'html'
                             await dest_client.send_file(
                                 dest["dest_channel_id"],
                                 file=native_media,
-                                caption=album_caption if album_caption else None,
-                                parse_mode='html',
-                                reply_to=reply_to_id
+                                **send_kwargs
                             )
                             logger.info(f"CLONE ÁLBUM NATIVO | Canal {channel.id} → {dest['dest_channel_name']}")
                             success = True
@@ -444,12 +515,18 @@ async def process_clone(userbot, channel, msg_group, db):
                     
                     if downloaded_paths:
                         try:
+                            dl_kwargs = {
+                                "caption": album_caption if album_caption else None,
+                                "reply_to": reply_to_id
+                            }
+                            if album_entities and not album_use_html:
+                                dl_kwargs["formatting_entities"] = album_entities
+                            else:
+                                dl_kwargs["parse_mode"] = 'html'
                             await dest_client.send_file(
                                 dest["dest_channel_id"],
                                 file=downloaded_paths,
-                                caption=album_caption if album_caption else None,
-                                parse_mode='html',
-                                reply_to=reply_to_id
+                                **dl_kwargs
                             )
                             logger.info(f"CLONE ÁLBUM DOWNLOAD | Canal {channel.id} → {dest['dest_channel_name']}")
                         except Exception as e:
@@ -468,14 +545,7 @@ async def process_clone(userbot, channel, msg_group, db):
 
         else:
             msg = first_msg
-            raw_text = msg.message or ''
-            if raw_text and getattr(msg, 'entities', None):
-                text = html.unparse(raw_text, msg.entities)
-            else:
-                text = raw_text
-
-            text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
-            text = apply_custom_caption(text, channel)
+            text, msg_entities, use_html = extract_text_and_entities(msg, channel)
             media_type = "text"
             
             if msg.media:
@@ -489,12 +559,19 @@ async def process_clone(userbot, channel, msg_group, db):
                 reply_to_id = dest_topic_ids.get(dest["dest_channel_id"])
                 success = False
 
+                # Monta kwargs de formatação (HTML ou entities diretas para custom emoji)
+                fmt_kwargs = {}
+                if msg_entities and not use_html:
+                    fmt_kwargs["formatting_entities"] = msg_entities
+                else:
+                    fmt_kwargs["parse_mode"] = 'html'
+
                 if not must_download:
                     try:
                         if msg.media:
-                            await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=msg.media, parse_mode='html', reply_to=reply_to_id)
+                            await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=msg.media, reply_to=reply_to_id, **fmt_kwargs)
                         elif text:
-                            await dest_client.send_message(dest["dest_channel_id"], message=text, parse_mode='html', reply_to=reply_to_id)
+                            await dest_client.send_message(dest["dest_channel_id"], message=text, reply_to=reply_to_id, **fmt_kwargs)
                         logger.info(f"CLONE NATIVO | Canal {channel.id} → {dest['dest_channel_name']}")
                         success = True
                     except Exception as e:
@@ -511,9 +588,9 @@ async def process_clone(userbot, channel, msg_group, db):
 
                     try:
                         if downloaded_paths:
-                            await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=downloaded_paths[0], parse_mode='html', reply_to=reply_to_id)
+                            await dest_client.send_message(dest["dest_channel_id"], message=text if text else None, file=downloaded_paths[0], reply_to=reply_to_id, **fmt_kwargs)
                         elif text:
-                            await dest_client.send_message(dest["dest_channel_id"], message=text, parse_mode='html', reply_to=reply_to_id)
+                            await dest_client.send_message(dest["dest_channel_id"], message=text, reply_to=reply_to_id, **fmt_kwargs)
                         logger.info(f"CLONE DOWNLOAD | Canal {channel.id} → {dest['dest_channel_name']}")
                     except Exception as e:
                         logger.error(f"CLONE ERRO | {dest['dest_channel_name']}: {e}")
@@ -628,24 +705,28 @@ async def process_spy(userbot, channel, msg_group, db):
     try:
         if is_album:
             album_caption = None
+            album_entities = None
+            album_use_html = True
             for msg in msg_group:
-                raw_text = msg.message or ''
-                if raw_text and getattr(msg, 'entities', None):
-                    msg_text = html.unparse(raw_text, msg.entities)
-                else:
-                    msg_text = raw_text
-
-                if msg_text and album_caption is None:
-                    album_caption = apply_cta_replacement(msg_text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
+                if album_caption is None:
+                    text, ents, use_html = extract_text_and_entities(msg, channel)
+                    if text:
+                        album_caption = text
+                        album_entities = ents
+                        album_use_html = use_html
             
-            album_caption = apply_custom_caption(album_caption, channel)
             bridge_msgs = None
+            spy_fmt = {}
+            if album_entities and not album_use_html:
+                spy_fmt["formatting_entities"] = album_entities
+            else:
+                spy_fmt["parse_mode"] = 'html'
             
             try:
                 # Tenta mandar instantaneamente pro canal ponte
                 native_media = [m.media for m in msg_group if m.media]
                 if native_media:
-                    bridge_msgs = await userbot.send_file(bridge_channel_id, file=native_media, caption=album_caption if album_caption else None, parse_mode='html')
+                    bridge_msgs = await userbot.send_file(bridge_channel_id, file=native_media, caption=album_caption if album_caption else None, **spy_fmt)
             except Exception as e:
                 logger.warning(f"SPY ÁLBUM nativo falhou, baixando: {e}")
                 if not downloaded_paths:
@@ -656,7 +737,7 @@ async def process_spy(userbot, channel, msg_group, db):
                                 if p: downloaded_paths.append(p)
                             except: pass
                 if downloaded_paths:
-                    bridge_msgs = await userbot.send_file(bridge_channel_id, file=downloaded_paths, caption=album_caption if album_caption else None, parse_mode='html')
+                    bridge_msgs = await userbot.send_file(bridge_channel_id, file=downloaded_paths, caption=album_caption if album_caption else None, **spy_fmt)
 
             if not bridge_msgs:
                 return None
@@ -681,21 +762,20 @@ async def process_spy(userbot, channel, msg_group, db):
 
         else:
             msg = first_msg
-            raw_text = msg.message or ''
-            if raw_text and getattr(msg, 'entities', None):
-                text = html.unparse(raw_text, msg.entities)
-            else:
-                text = raw_text
-
-            text = apply_cta_replacement(text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
-            text = apply_custom_caption(text, channel)
+            text, msg_entities, use_html = extract_text_and_entities(msg, channel)
             bridge_msg = None
+
+            spy_fmt = {}
+            if msg_entities and not use_html:
+                spy_fmt["formatting_entities"] = msg_entities
+            else:
+                spy_fmt["parse_mode"] = 'html'
 
             try:
                 if msg.media:
-                    bridge_msg = await userbot.send_message(bridge_channel_id, message=text if text else None, file=msg.media, parse_mode='html')
+                    bridge_msg = await userbot.send_message(bridge_channel_id, message=text if text else None, file=msg.media, **spy_fmt)
                 elif text:
-                    bridge_msg = await userbot.send_message(bridge_channel_id, message=text, parse_mode='html')
+                    bridge_msg = await userbot.send_message(bridge_channel_id, message=text, **spy_fmt)
             except Exception as e:
                 logger.warning(f"SPY nativo falhou, baixando: {e}")
                 if msg.media:
@@ -704,7 +784,7 @@ async def process_spy(userbot, channel, msg_group, db):
                         if p: downloaded_paths.append(p)
                     except: pass
                 if downloaded_paths:
-                    bridge_msg = await userbot.send_message(bridge_channel_id, message=text if text else None, file=downloaded_paths[0], parse_mode='html')
+                    bridge_msg = await userbot.send_message(bridge_channel_id, message=text if text else None, file=downloaded_paths[0], **spy_fmt)
 
             if not bridge_msg:
                 return None
