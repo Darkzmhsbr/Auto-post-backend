@@ -10,6 +10,8 @@ import os
 import asyncio
 import logging
 import json
+import re
+import copy
 from collections import OrderedDict
 from datetime import datetime, time as dt_time
 from pytz import timezone
@@ -77,8 +79,6 @@ def apply_cta_replacement(text, cta_find, cta_replace, cta_mode="exact"):
         return text
     
     if cta_mode == "smart":
-        import re
-        
         def replace_href(match):
             return f'<a href="{cta_replace}">'
         text = re.sub(r'<a\s+href="https?://t\.me/[^"]*">', replace_href, text)
@@ -119,7 +119,7 @@ def extract_text_and_entities(msg, channel):
     Extrai texto e entities de uma mensagem de forma inteligente.
     
     Se a mensagem contém custom emojis (Premium), preserva as entities originais 
-    e aplica CTA/caption no texto puro (sem converter para HTML).
+    e aplica CTA/caption no texto puro E diretamente nas entities (ajustando as posições).
     
     Se NÃO contém custom emojis, usa html.unparse normalmente (comportamento legado).
     
@@ -134,33 +134,74 @@ def extract_text_and_entities(msg, channel):
         return '', None, True
     
     if has_custom_emoji(entities):
-        # 🌟 MODO PREMIUM EMOJI: preserva entities originais
-        # Aplica CTA no texto puro (sem HTML), mantém entities intactas
-        text = apply_cta_replacement(raw_text, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
-        text = apply_custom_caption(text, channel)
+        # 🌟 MODO PREMIUM EMOJI: Preservar entities originais e editar links diretamente!
+        ents = [copy.copy(e) for e in entities] # Copia rasa segura para modificar offset/length/url
         
-        # Se o CTA mudou o tamanho do texto, as entities podem ficar desalinhadas.
-        # Se o texto NÃO mudou de tamanho, mantemos as entities perfeitas.
-        # Se mudou, fazemos fallback para HTML (perde custom emoji mas mantém formatação básica)
-        if len(text) == len(raw_text):
-            return text, list(entities), False
-        elif text == raw_text:
-            return text, list(entities), False
-        else:
-            # Texto mudou de tamanho por CTA/caption → entities desalinhadas
-            # Tenta preservar entities que ainda cabem no texto
-            adjusted_entities = []
-            for e in entities:
-                if e.offset + e.length <= len(text):
-                    adjusted_entities.append(e)
-            if adjusted_entities:
-                return text, adjusted_entities, False
-            # Nenhuma entity se encaixa → fallback HTML (perde custom emoji)
-            logger.warning(f"Custom emojis perdidos pois CTA alterou tamanho do texto (msg_id={msg.id})")
-            text_html = html.unparse(raw_text, entities)
-            text_html = apply_cta_replacement(text_html, channel.cta_find, channel.cta_replace, getattr(channel, 'cta_mode', 'exact'))
-            text_html = apply_custom_caption(text_html, channel)
-            return text_html, None, True
+        cta_mode = getattr(channel, 'cta_mode', 'exact')
+        cta_find = channel.cta_find
+        cta_replace = channel.cta_replace
+        
+        if cta_replace:
+            # 1. Atualizar links EMBUTIDOS (Ex: Palavra com link camuflado nas Entities)
+            for e in ents:
+                if hasattr(e, 'url') and e.url:
+                    if cta_mode == 'smart':
+                        if "t.me/" in e.url or "telegram.me/" in e.url:
+                            e.url = cta_replace
+                    elif cta_mode == 'exact' and cta_find and cta_find in e.url:
+                        e.url = e.url.replace(cta_find, cta_replace)
+            
+            # 2. Atualizar links ESCRITOS NO TEXTO e recalcular posições das entities (Offsets)
+            new_text = raw_text
+            if cta_mode == 'exact' and cta_find and cta_find in new_text:
+                diff = len(cta_replace) - len(cta_find)
+                starts = [m.start() for m in re.finditer(re.escape(cta_find), new_text)]
+                new_text = new_text.replace(cta_find, cta_replace)
+                
+                if diff != 0:
+                    for e in ents:
+                        rb = sum(1 for s in starts if s < e.offset)
+                        ri = sum(1 for s in starts if e.offset <= s < e.offset + e.length)
+                        e.offset += (rb * diff)
+                        e.length += (ri * diff)
+                        
+            elif cta_mode == 'smart':
+                pattern = re.compile(r'https?://(?:t\.me|telegram\.me)/\S+|(?<!["/])(?<!\w)t\.me/\S+')
+                matches = list(pattern.finditer(new_text))
+                if matches:
+                    shifts = []
+                    last_end = 0
+                    temp_text = ""
+                    for m in matches:
+                        start, end = m.span()
+                        diff = len(cta_replace) - (end - start)
+                        temp_text += new_text[last_end:start] + cta_replace
+                        shifts.append((start, diff))
+                        last_end = end
+                    temp_text += new_text[last_end:]
+                    new_text = temp_text
+                    
+                    for e in ents:
+                        sb = sum(d for pos, d in shifts if pos < e.offset)
+                        si = sum(d for pos, d in shifts if e.offset <= pos < e.offset + e.length)
+                        e.offset += sb
+                        e.length += si
+                        
+            raw_text = new_text
+        
+        # 3. Aplicar a Legenda Personalizada (Caption)
+        if channel.use_custom_caption and channel.custom_caption:
+            if channel.caption_mode == 'append':
+                separator = "\n\n" if raw_text else ""
+                raw_text = raw_text + separator + channel.custom_caption
+                return raw_text, ents, False
+            else:
+                # Se for Replace total, perdemos a necessidade dos emojis antigos (pois o texto sumiu)
+                # Convertendo pro HTML pra pegar a formatação básica
+                return channel.custom_caption, None, True
+                
+        return raw_text, ents, False
+        
     else:
         # Modo padrão: HTML (sem custom emoji)
         if entities:
