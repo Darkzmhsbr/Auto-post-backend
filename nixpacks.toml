@@ -1,0 +1,24 @@
+# ============================================================
+# nixpacks.toml — AutoPost Backend (Railway)
+# ============================================================
+# Declara pacotes do sistema necessários para as Ferramentas
+# de Criativos. O Railway usa Nixpacks para fazer o build e
+# este arquivo instrui quais binários instalar além do Python.
+#
+# ffmpeg  → processamento de vídeo (Cloaker, Cortador, etc.)
+# libpq   → já incluído via psycopg2-binary (não precisa aqui)
+# ============================================================
+
+[phases.setup]
+nixPkgs = [
+  "ffmpeg",        # Binário principal — usado por ffmpeg-python
+  "libffi",        # Dependência de criptografia (python-jose)
+]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt"
+]
+
+[start]
+cmd = "uvicorn main:app --host 0.0.0.0 --port $PORT"
