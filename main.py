@@ -1,7 +1,13 @@
 import os
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, status
+import uuid
+import json
+import asyncio
+import shutil
+import tempfile
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -13,7 +19,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
-from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination, AutopostAdmin, AutopostTopicMap, engine, Base
+from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination, AutopostAdmin, AutopostTopicMap, FerramentsJob, engine, Base
 from engine import start_engine, stop_engine, get_engine_status
 
 init_db()
@@ -41,6 +47,26 @@ SECRET_KEY = os.getenv("SECRET_KEY", "chave-secreta-padrao")
 ALGORITHM = "HS256"
 
 pending_logins = {}
+
+# ==========================================
+# CONFIGURAÇÃO — FERRAMENTAS DE CRIATIVOS
+# ==========================================
+ZENYX_API_URL = os.getenv("ZENYX_API_URL", "https://api.zenyxvips.com")
+
+# Diretório temporário para arquivos de upload/output
+FERRAMENTAS_TMP_DIR = os.getenv("FERRAMENTAS_TMP_DIR", "/tmp/ferramentas")
+os.makedirs(FERRAMENTAS_TMP_DIR, exist_ok=True)
+
+# Cache de status Prime por user_id → (timestamp, is_unlocked)
+# Evita chamar a Zenyx a cada request — TTL de 5 minutos
+_prime_cache: dict = {}
+PRIME_CACHE_TTL = 300  # segundos
+
+# Extensões aceitas por tipo
+EXTENSOES_IMAGEM = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+EXTENSOES_VIDEO  = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+EXTENSOES_AUDIO  = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac"}
+TAMANHO_MAX_UPLOAD = 500 * 1024 * 1024  # 500MB
 
 # ==========================================
 # CÉREBRO DA AUTENTICAÇÃO (SSO)
@@ -74,8 +100,367 @@ def require_superadmin(user_id: str = Depends(get_current_user), db: Session = D
     return user_id
 
 # ==========================================
-# MODELOS DE DADOS (Pydantic)
+# HELPERS — FERRAMENTAS DE CRIATIVOS
 # ==========================================
+
+async def verificar_prime_clonador(token: str) -> bool:
+    """
+    Consulta a Zenyx API para verificar se o usuário tem o recurso
+    'clonador_previas' desbloqueado. Cache local de 5 minutos por user.
+    """
+    import time
+    now = time.time()
+
+    # Tenta extrair user_id do token para usar como chave de cache
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_aud": False})
+        uid = str(payload.get("sub") or payload.get("id") or payload.get("user_id") or "")
+    except Exception:
+        uid = token[:32]  # fallback: usa prefixo do token
+
+    # Verifica cache
+    if uid in _prime_cache:
+        ts, unlocked = _prime_cache[uid]
+        if now - ts < PRIME_CACHE_TTL:
+            return unlocked
+
+    # Chama a Zenyx API
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(
+                f"{ZENYX_API_URL}/api/admin/recursos-prime",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            recursos = data.get("recursos", [])
+            for rec in recursos:
+                if rec.get("id") == "clonador_previas" and rec.get("status") == "desbloqueado":
+                    _prime_cache[uid] = (now, True)
+                    return True
+            _prime_cache[uid] = (now, False)
+            return False
+    except Exception:
+        # Em caso de falha na consulta, libera se já estava em cache (mesmo expirado)
+        if uid in _prime_cache:
+            return _prime_cache[uid][1]
+        return False
+
+    _prime_cache[uid] = (now, False)
+    return False
+
+
+def get_extensao(filename: str) -> str:
+    return os.path.splitext(filename.lower())[1]
+
+
+def salvar_upload(file_bytes: bytes, filename: str) -> str:
+    """Salva o arquivo recebido em FERRAMENTAS_TMP_DIR com nome único."""
+    ext = get_extensao(filename)
+    nome_unico = f"{uuid.uuid4().hex}{ext}"
+    caminho = os.path.join(FERRAMENTAS_TMP_DIR, nome_unico)
+    with open(caminho, "wb") as f:
+        f.write(file_bytes)
+    return nome_unico
+
+
+def caminho_completo(filename: str) -> str:
+    return os.path.join(FERRAMENTAS_TMP_DIR, filename)
+
+
+async def _processar_imagem_sync(job: FerramentsJob, db: Session):
+    """
+    Processa jobs de imagem de forma síncrona em background thread.
+    Atualiza o job no banco ao final (done ou error).
+    """
+    import time
+    from PIL import Image
+    import piexif
+
+    try:
+        job.status = "processing"
+        db.commit()
+
+        input_path  = caminho_completo(job.input_filename)
+        ext         = get_extensao(job.input_filename)
+        output_nome = f"{uuid.uuid4().hex}{ext}"
+        output_path = caminho_completo(output_nome)
+        params      = json.loads(job.parametros or "{}")
+
+        if job.tipo == "limpar_metadados":
+            # Remove EXIF/metadados de imagens preservando qualidade
+            img = Image.open(input_path)
+            # Cria nova imagem sem metadados
+            dados = list(img.getdata())
+            img_limpa = Image.new(img.mode, img.size)
+            img_limpa.putdata(dados)
+            # Salva sem info de metadata
+            save_kwargs = {}
+            if ext in (".jpg", ".jpeg"):
+                save_kwargs = {"quality": 95, "optimize": True, "exif": b""}
+            img_limpa.save(output_path, **save_kwargs)
+
+        elif job.tipo == "conversor_proporcao":
+            # Converte entre 9:16 (Stories/Reels) e 3:4 (Feed)
+            proporcao_alvo = params.get("proporcao", "9:16")
+            img = Image.open(input_path)
+            w, h = img.size
+            if proporcao_alvo == "9:16":
+                alvo_w = min(w, int(h * 9 / 16))
+                alvo_h = min(h, int(w * 16 / 9))
+            else:  # 3:4
+                alvo_w = min(w, int(h * 3 / 4))
+                alvo_h = min(h, int(w * 4 / 3))
+            # Recorta centralizado
+            left = (w - alvo_w) // 2
+            top  = (h - alvo_h) // 2
+            img_crop = img.crop((left, top, left + alvo_w, top + alvo_h))
+            img_crop.save(output_path, quality=95, optimize=True)
+
+        elif job.tipo == "cloaker_criativo":
+            # Hash único: altera 1 pixel invisível + limpa metadados + adiciona ruído mínimo
+            import random
+            img = Image.open(input_path).convert("RGBA")
+            pixels = img.load()
+            # Altera pixel no canto inferior direito — imperceptível
+            px, py = img.size[0] - 1, img.size[1] - 1
+            r, g, b, a = pixels[px, py]
+            pixels[px, py] = (
+                max(0, min(255, r + random.randint(-2, 2))),
+                max(0, min(255, g + random.randint(-2, 2))),
+                max(0, min(255, b + random.randint(-2, 2))),
+                a
+            )
+            # Salva como RGB sem metadados
+            img.convert("RGB").save(output_path, quality=95, optimize=True, exif=b"")
+
+        elif job.tipo == "marca_dagua":
+            # Adiciona marca d'água de texto ou imagem
+            from PIL import ImageDraw, ImageFont
+            texto_wm  = params.get("texto", "© Criativo")
+            posicao   = params.get("posicao", "bottom_right")  # top_left, top_right, bottom_left, bottom_right, center
+            opacidade = int(params.get("opacidade", 70))
+
+            img = Image.open(input_path).convert("RGBA")
+            overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+            except Exception:
+                font = ImageFont.load_default()
+
+            bbox = draw.textbbox((0, 0), texto_wm, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            iw, ih = img.size
+            margem = 20
+
+            pos_map = {
+                "top_left":     (margem, margem),
+                "top_right":    (iw - tw - margem, margem),
+                "bottom_left":  (margem, ih - th - margem),
+                "bottom_right": (iw - tw - margem, ih - th - margem),
+                "center":       ((iw - tw) // 2, (ih - th) // 2),
+            }
+            pos_xy = pos_map.get(posicao, pos_map["bottom_right"])
+
+            # Sombra sutil para legibilidade
+            draw.text((pos_xy[0]+2, pos_xy[1]+2), texto_wm, font=font, fill=(0, 0, 0, opacidade))
+            draw.text(pos_xy, texto_wm, font=font, fill=(255, 255, 255, opacidade))
+
+            resultado = Image.alpha_composite(img, overlay).convert("RGB")
+            resultado.save(output_path, quality=95)
+
+        elif job.tipo == "gerador_preview":
+            # Gera versão "censurada" — aplica blur no centro da imagem
+            from PIL import ImageFilter
+            img = Image.open(input_path)
+            iw, ih = img.size
+            # Área de blur: 60% central
+            margem_x = int(iw * 0.20)
+            margem_y = int(ih * 0.20)
+            area_blur = img.crop((margem_x, margem_y, iw - margem_x, ih - margem_y))
+            area_borrada = area_blur.filter(ImageFilter.GaussianBlur(radius=15))
+            img.paste(area_borrada, (margem_x, margem_y))
+            img.save(output_path, quality=95)
+
+        else:
+            raise ValueError(f"Tipo de job de imagem desconhecido: {job.tipo}")
+
+        job.output_filename = output_nome
+        job.status = "done"
+        db.commit()
+
+    except Exception as e:
+        job.status = "error"
+        job.error_msg = str(e)
+        db.commit()
+
+
+def _processar_video_sync(job_id: int):
+    """
+    Processamento de vídeo chamado pelo APScheduler (thread separada).
+    Busca o job pelo ID, processa com ffmpeg, atualiza o banco.
+    """
+    import ffmpeg as ffmpeg_python
+
+    db = SessionLocal()
+    try:
+        job = db.query(FerramentsJob).filter(FerramentsJob.id == job_id).first()
+        if not job or job.status != "pending":
+            return
+
+        job.status = "processing"
+        db.commit()
+
+        input_path  = caminho_completo(job.input_filename)
+        ext_in      = get_extensao(job.input_filename)
+        output_nome = f"{uuid.uuid4().hex}{ext_in}"
+        output_path = caminho_completo(output_nome)
+        params      = json.loads(job.parametros or "{}")
+
+        if job.tipo == "conversor_proporcao":
+            # Converte vídeo entre 9:16 e 3:4 com crop centralizado
+            proporcao = params.get("proporcao", "9:16")
+            if proporcao == "9:16":
+                filtro = "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920"
+            else:  # 3:4
+                filtro = "crop=ih*3/4:ih:(iw-ih*3/4)/2:0,scale=1080:1440"
+
+            (
+                ffmpeg_python
+                .input(input_path)
+                .output(output_path, vf=filtro, acodec="aac", vcodec="libx264",
+                        crf=23, preset="fast", movflags="+faststart")
+                .overwrite_output()
+                .run(quiet=True)
+            )
+
+        elif job.tipo == "cloaker_video":
+            # Cloaker: reencoda com CRF ligeiramente diferente + metadata limpa
+            # Isso gera um hash completamente diferente sem alterar qualidade visível
+            import random
+            crf_variado = 22 + random.randint(0, 3)  # 22-25, imperceptível
+            (
+                ffmpeg_python
+                .input(input_path)
+                .output(
+                    output_path,
+                    vcodec="libx264", crf=crf_variado, preset="fast",
+                    acodec="aac", audio_bitrate="128k",
+                    movflags="+faststart",
+                    map_metadata=-1,  # Remove todos os metadados
+                    metadata="title=",
+                    metadata_a="comment=",
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
+
+        elif job.tipo == "cortar_video":
+            inicio = params.get("inicio", "00:00:00")   # HH:MM:SS
+            fim    = params.get("fim", None)             # HH:MM:SS ou None (até o final)
+            kwargs = {"ss": inicio, "acodec": "copy", "vcodec": "copy", "movflags": "+faststart"}
+            if fim:
+                kwargs["to"] = fim
+            (
+                ffmpeg_python
+                .input(input_path)
+                .output(output_path, **kwargs)
+                .overwrite_output()
+                .run(quiet=True)
+            )
+
+        elif job.tipo == "marca_dagua":
+            # Watermark de texto em vídeo usando drawtext
+            texto    = params.get("texto", "© Criativo")
+            posicao  = params.get("posicao", "bottom_right")
+            opacidade = float(params.get("opacidade", 0.7))
+
+            pos_expr = {
+                "top_left":     "x=20:y=20",
+                "top_right":    "x=w-tw-20:y=20",
+                "bottom_left":  "x=20:y=h-th-20",
+                "bottom_right": "x=w-tw-20:y=h-th-20",
+                "center":       "x=(w-tw)/2:y=(h-th)/2",
+            }.get(posicao, "x=w-tw-20:y=h-th-20")
+
+            drawtext = (
+                f"drawtext=text='{texto}':"
+                f"fontsize=36:fontcolor=white@{opacidade}:"
+                f"shadowx=2:shadowy=2:shadowcolor=black@{opacidade}:"
+                f"{pos_expr}"
+            )
+            (
+                ffmpeg_python
+                .input(input_path)
+                .output(output_path, vf=drawtext, acodec="aac", vcodec="libx264",
+                        crf=23, preset="fast", movflags="+faststart")
+                .overwrite_output()
+                .run(quiet=True)
+            )
+
+        elif job.tipo == "processamento_completo":
+            # All-in-One: limpa metadados + reencoda + aplica hash único (cloaker)
+            import random
+            crf_variado = 22 + random.randint(0, 3)
+            (
+                ffmpeg_python
+                .input(input_path)
+                .output(
+                    output_path,
+                    vcodec="libx264", crf=crf_variado, preset="fast",
+                    acodec="aac", audio_bitrate="128k",
+                    movflags="+faststart",
+                    map_metadata=-1,
+                    metadata="title=",
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
+
+        elif job.tipo == "gerador_preview":
+            # Gera preview censurado: blur pesado na região central do vídeo
+            filtro_blur = (
+                "[0:v]split=2[original][blur];"
+                "[blur]crop=iw*0.6:ih*0.6:iw*0.2:ih*0.2,boxblur=20:20[blurred];"
+                "[original][blurred]overlay=iw*0.2:ih*0.2[out]"
+            )
+            (
+                ffmpeg_python
+                .input(input_path)
+                .output(output_path, filter_complex=filtro_blur, map="[out]",
+                        acodec="aac", vcodec="libx264", crf=23, preset="fast",
+                        movflags="+faststart")
+                .overwrite_output()
+                .run(quiet=True)
+            )
+
+        elif job.tipo == "limpar_metadados":
+            # Remove metadados de vídeo/áudio sem reencoder (copy streams)
+            (
+                ffmpeg_python
+                .input(input_path)
+                .output(output_path, acodec="copy", vcodec="copy",
+                        map_metadata=-1, movflags="+faststart")
+                .overwrite_output()
+                .run(quiet=True)
+            )
+
+        else:
+            raise ValueError(f"Tipo de job de vídeo desconhecido: {job.tipo}")
+
+        job.output_filename = output_nome
+        job.status = "done"
+        db.commit()
+
+    except Exception as e:
+        if job:
+            job.status = "error"
+            job.error_msg = str(e)
+            db.commit()
+    finally:
+        db.close()
 class TelegramRequestCode(BaseModel):
     phone: str
     api_id: str
@@ -880,7 +1265,257 @@ def clonex_status(user_id: str = Depends(get_current_user), db: Session = Depend
     }
 
 # ==========================================
-# 9. ROTA DE MIGRAÇÃO (Acessar via URL para aplicar novas colunas)
+# 9. FERRAMENTAS DE CRIATIVOS
+# ==========================================
+#
+# Fluxo:
+#   1. POST /api/ferramentas/processar  → recebe arquivo + tipo + params
+#      • Verifica se o recurso 'clonador_previas' está desbloqueado na Zenyx
+#      • Imagens: processa em background imediato → job fica 'done' em segundos
+#      • Vídeos:  cria job 'pending' → APScheduler processa em background
+#      • Retorna { job_id, status }
+#
+#   2. GET /api/ferramentas/status/{job_id} → polling do frontend (a cada 3s)
+#      • Retorna { status, download_url } quando done
+#
+#   3. GET /api/ferramentas/download/{job_id} → download do arquivo processado
+#
+#   4. GET /api/ferramentas/jobs → lista jobs recentes do usuário
+#
+# Tipos suportados:
+#   Imagem síncrona: limpar_metadados, conversor_proporcao, cloaker_criativo,
+#                    marca_dagua (imagem), gerador_preview (imagem)
+#   Vídeo assíncrono: conversor_proporcao, cloaker_video, cortar_video,
+#                     marca_dagua (vídeo), processamento_completo,
+#                     gerador_preview (vídeo), limpar_metadados (vídeo/áudio)
+# ==========================================
+
+# Tipos que processam imagem de forma síncrona
+_TIPOS_IMAGEM_SYNC = {
+    "limpar_metadados",
+    "conversor_proporcao",
+    "cloaker_criativo",
+    "marca_dagua",
+    "gerador_preview",
+}
+
+# Todos os tipos válidos
+_TIPOS_VALIDOS = {
+    "limpar_metadados",
+    "conversor_proporcao",
+    "cloaker_criativo",
+    "processamento_completo",
+    "cloaker_video",
+    "cortar_video",
+    "marca_dagua",
+    "gerador_preview",
+}
+
+
+@app.post("/api/ferramentas/processar")
+async def processar_ferramenta(
+    background_tasks: BackgroundTasks,
+    tipo: str = Form(...),
+    parametros: Optional[str] = Form("{}"),
+    arquivo: UploadFile = File(...),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Recebe um arquivo e o tipo de ferramenta, cria um job e inicia o processamento.
+    Para imagens: processa em background imediato (retorna done em segundos).
+    Para vídeos/áudios: cria job pending e agenda processamento via thread.
+    """
+    # 1. Verificar acesso Prime
+    token = credentials.credentials
+    prime_ok = await verificar_prime_clonador(token)
+    if not prime_ok:
+        # Super admins do AutoPost têm acesso irrestrito
+        admin = db.query(AutopostAdmin).filter(AutopostAdmin.user_id == user_id).first()
+        if not admin:
+            raise HTTPException(
+                status_code=403,
+                detail="Acesso negado: você precisa desbloquear o recurso 'Clonador de Prévias/VIPs' na plataforma Zenyx VIPs para usar as Ferramentas de Criativos."
+            )
+
+    # 2. Validar tipo
+    if tipo not in _TIPOS_VALIDOS:
+        raise HTTPException(status_code=400, detail=f"Tipo inválido: '{tipo}'. Tipos aceitos: {sorted(_TIPOS_VALIDOS)}")
+
+    # 3. Validar e ler arquivo
+    if arquivo.size and arquivo.size > TAMANHO_MAX_UPLOAD:
+        raise HTTPException(status_code=413, detail="Arquivo muito grande. Limite: 500MB.")
+
+    conteudo = await arquivo.read()
+    if len(conteudo) > TAMANHO_MAX_UPLOAD:
+        raise HTTPException(status_code=413, detail="Arquivo muito grande. Limite: 500MB.")
+
+    ext = get_extensao(arquivo.filename or "arquivo.bin")
+    if not ext:
+        raise HTTPException(status_code=400, detail="Arquivo sem extensão reconhecida.")
+
+    # 4. Salvar arquivo de entrada
+    input_nome = salvar_upload(conteudo, arquivo.filename or f"input{ext}")
+
+    # 5. Criar job no banco
+    try:
+        params_dict = json.loads(parametros or "{}")
+    except json.JSONDecodeError:
+        params_dict = {}
+
+    job = FerramentsJob(
+        user_id=user_id,
+        tipo=tipo,
+        status="pending",
+        input_filename=input_nome,
+        parametros=json.dumps(params_dict),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    # 6. Decidir: imagem síncrona ou vídeo assíncrono
+    eh_imagem = ext in EXTENSOES_IMAGEM
+    eh_video  = ext in EXTENSOES_VIDEO
+    eh_audio  = ext in EXTENSOES_AUDIO
+
+    if eh_imagem and tipo in _TIPOS_IMAGEM_SYNC:
+        # Processa em background imediato (Pillow — milissegundos)
+        background_tasks.add_task(_processar_imagem_sync, job, db)
+        return {
+            "job_id": job.id,
+            "status": "processing",
+            "tipo": tipo,
+            "mensagem": "Processando imagem... consulte /api/ferramentas/status/{job_id}",
+        }
+    else:
+        # Vídeo ou áudio → agenda em thread separada para não bloquear
+        import threading
+        t = threading.Thread(target=_processar_video_sync, args=(job.id,), daemon=True)
+        t.start()
+        return {
+            "job_id": job.id,
+            "status": "pending",
+            "tipo": tipo,
+            "mensagem": "Job criado! O processamento de vídeo pode levar alguns minutos. Consulte /api/ferramentas/status/{job_id}",
+        }
+
+
+@app.get("/api/ferramentas/status/{job_id}")
+def status_ferramenta(
+    job_id: int,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Retorna o status atual do job. O frontend faz polling a cada 3s."""
+    job = db.query(FerramentsJob).filter(
+        FerramentsJob.id == job_id,
+        FerramentsJob.user_id == user_id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado.")
+
+    resp = {
+        "job_id": job.id,
+        "tipo": job.tipo,
+        "status": job.status,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+    }
+    if job.status == "done":
+        resp["download_url"] = f"/api/ferramentas/download/{job.id}"
+    if job.status == "error":
+        resp["error_msg"] = job.error_msg
+    return resp
+
+
+@app.get("/api/ferramentas/download/{job_id}")
+def download_ferramenta(
+    job_id: int,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Faz download do arquivo processado. Só disponível quando status='done'."""
+    job = db.query(FerramentsJob).filter(
+        FerramentsJob.id == job_id,
+        FerramentsJob.user_id == user_id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado.")
+    if job.status != "done" or not job.output_filename:
+        raise HTTPException(status_code=400, detail=f"Arquivo ainda não disponível. Status atual: {job.status}")
+
+    output_path = caminho_completo(job.output_filename)
+    if not os.path.exists(output_path):
+        raise HTTPException(status_code=404, detail="Arquivo processado não encontrado no servidor.")
+
+    # Nome de download amigável: tipo_ferramenta + extensão original
+    ext = get_extensao(job.output_filename)
+    nome_download = f"{job.tipo}{ext}"
+
+    return FileResponse(
+        path=output_path,
+        filename=nome_download,
+        media_type="application/octet-stream",
+    )
+
+
+@app.get("/api/ferramentas/jobs")
+def listar_jobs_ferramentas(
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    limit: int = 20,
+):
+    """Lista os jobs mais recentes do usuário (para histórico na UI)."""
+    jobs = (
+        db.query(FerramentsJob)
+        .filter(FerramentsJob.user_id == user_id)
+        .order_by(FerramentsJob.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "job_id": j.id,
+            "tipo": j.tipo,
+            "status": j.status,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "download_url": f"/api/ferramentas/download/{j.id}" if j.status == "done" else None,
+            "error_msg": j.error_msg if j.status == "error" else None,
+        }
+        for j in jobs
+    ]
+
+
+@app.delete("/api/ferramentas/jobs/{job_id}")
+def deletar_job_ferramenta(
+    job_id: int,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Remove um job e seus arquivos do disco."""
+    job = db.query(FerramentsJob).filter(
+        FerramentsJob.id == job_id,
+        FerramentsJob.user_id == user_id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado.")
+
+    # Remove arquivos do disco
+    for fname in [job.input_filename, job.output_filename]:
+        if fname:
+            try:
+                os.remove(caminho_completo(fname))
+            except FileNotFoundError:
+                pass
+
+    db.delete(job)
+    db.commit()
+    return {"message": "Job removido com sucesso."}
+
+
+# ==========================================
+# 10. ROTA DE MIGRAÇÃO (Acessar via URL para aplicar novas colunas)
 # ==========================================
 @app.get("/api/migrate")
 def run_migration(db: Session = Depends(get_db)):
@@ -895,6 +1530,7 @@ def run_migration(db: Session = Depends(get_db)):
     - Colunas custom_caption, use_custom_caption, caption_mode em autopost_channels_v2
     - Coluna auto_topic_clone
     - [CLONEX] Limite de 50MB aplicado no engine (sem alteração de schema)
+    - [FERRAMENTAS] Tabela ferramentas_jobs (Ferramentas de Criativos)
     """
     from sqlalchemy import text, inspect
     
@@ -953,6 +1589,13 @@ def run_migration(db: Session = Depends(get_db)):
             results.append("✅ Tabela 'autopost_topic_maps' criada!")
         else:
             results.append("ℹ️ Tabela 'autopost_topic_maps' já existe.")
+
+        # 6. Cria tabela ferramentas_jobs se não existir (Ferramentas de Criativos)
+        if "ferramentas_jobs" not in existing_tables:
+            Base.metadata.tables["ferramentas_jobs"].create(bind=engine)
+            results.append("✅ Tabela 'ferramentas_jobs' criada! (Ferramentas de Criativos)")
+        else:
+            results.append("ℹ️ Tabela 'ferramentas_jobs' já existe.")
         
         return {"status": "success", "migrations": results}
     

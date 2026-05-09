@@ -154,5 +154,44 @@ class AutopostTopicMap(Base):
     
     channel = relationship("AutopostChannel", backref="topic_maps")
 
+# ==========================================
+# 👇 NOVA TABELA: FERRAMENTAS DE CRIATIVOS
+# ==========================================
+class FerramentsJob(Base):
+    """
+    Rastreia jobs de processamento de mídia das Ferramentas de Criativos.
+    Imagens: processamento síncrono (status vai direto para 'done').
+    Vídeos:  processamento assíncrono via APScheduler (pending → processing → done/error).
+    """
+    __tablename__ = "ferramentas_jobs"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    user_id     = Column(String, nullable=False, index=True)
+
+    # Tipo da ferramenta: 'limpar_metadados', 'conversor_proporcao', 'cloaker_criativo',
+    # 'processamento_completo', 'cloaker_video', 'cortar_video', 'marca_dagua', 'gerador_preview'
+    tipo        = Column(String(50), nullable=False, index=True)
+
+    # Controle de estado
+    status      = Column(String(20), default='pending', index=True)
+    # 'pending' → aguardando processamento (vídeos)
+    # 'processing' → engine processando
+    # 'done' → concluído, output_filename disponível
+    # 'error' → falhou, ver error_msg
+
+    # Arquivos
+    input_filename  = Column(String(255), nullable=True)   # Nome salvo no disco/temp
+    output_filename = Column(String(255), nullable=True)   # Nome do arquivo gerado
+
+    # Parâmetros específicos da ferramenta (JSON)
+    # Ex: {"start": "00:00:10", "end": "00:01:30"} para cortar_video
+    # Ex: {"position": "bottom_right", "opacity": 0.7} para marca_dagua
+    parametros  = Column(Text, nullable=True)
+
+    error_msg   = Column(Text, nullable=True)
+    created_at  = Column(DateTime, default=now_brazil, index=True)
+    updated_at  = Column(DateTime, default=now_brazil, onupdate=now_brazil)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
