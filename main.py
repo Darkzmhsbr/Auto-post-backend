@@ -22,26 +22,6 @@ from telethon.errors import SessionPasswordNeededError
 from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination, AutopostAdmin, AutopostTopicMap, FerramentsJob, engine, Base
 from engine import start_engine, stop_engine, get_engine_status
 
-# ============================================================
-# 🔧 PATCH FFMPEG — static-ffmpeg (Railway Railpack)
-# O Railpack não preserva binários instalados via apt no build.
-# O pacote static-ffmpeg traz o binário embutido em Python e
-# o registra no PATH do processo via add_paths().
-# Isso garante que ffmpeg-python encontre o executável em
-# qualquer container, sem apt-get nem nixpacks.
-# ============================================================
-try:
-    import static_ffmpeg
-    static_ffmpeg.add_paths()
-    import logging as _ffmpeg_log
-    _ffmpeg_log.getLogger("autopost").info("✅ static-ffmpeg registrado no PATH.")
-except Exception as _e_sf:
-    import logging as _ffmpeg_log
-    _ffmpeg_log.getLogger("autopost").warning(
-        f"⚠️ static-ffmpeg não disponível ({_e_sf}). "
-        "Ferramentas de vídeo usarão ffmpeg do sistema se instalado."
-    )
-
 init_db()
 app = FastAPI(title="Zenyx AutoPost API", version="1.0")
 
@@ -317,14 +297,20 @@ async def _processar_imagem_sync(job: FerramentsJob, db: Session):
         db.commit()
 
 
+
 def _processar_video_sync(job_id: int):
     """
-    Processamento de vídeo chamado pelo APScheduler (thread separada).
-    Busca o job pelo ID, processa com ffmpeg, atualiza o banco.
+    Processamento de vídeo chamado em thread separada.
+    Usa subprocess direto com ffmpeg para máximo controle sobre
+    parâmetros e captura completa do stderr em caso de erro.
     """
-    import ffmpeg as ffmpeg_python
+    import subprocess
+    import random
+    import logging
+    _logger = logging.getLogger("autopost")
 
     db = SessionLocal()
+    job = None
     try:
         job = db.query(FerramentsJob).filter(FerramentsJob.id == job_id).first()
         if not job or job.status != "pending":
@@ -339,64 +325,46 @@ def _processar_video_sync(job_id: int):
         output_path = caminho_completo(output_nome)
         params      = json.loads(job.parametros or "{}")
 
+        # Monta o comando ffmpeg baseado no tipo
+        cmd = None
+
         if job.tipo == "conversor_proporcao":
-            # Converte vídeo entre 9:16 e 3:4 com crop centralizado
             proporcao = params.get("proporcao", "9:16")
             if proporcao == "9:16":
                 filtro = "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920"
-            else:  # 3:4
+            else:
                 filtro = "crop=ih*3/4:ih:(iw-ih*3/4)/2:0,scale=1080:1440"
-
-            (
-                ffmpeg_python
-                .input(input_path)
-                .output(output_path, vf=filtro, acodec="aac", vcodec="libx264",
-                        crf=23, preset="fast", movflags="+faststart")
-                .overwrite_output()
-                .run(quiet=True)
-            )
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", filtro,
+                "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                "-c:a", "aac", "-movflags", "+faststart",
+                output_path
+            ]
 
         elif job.tipo == "cloaker_video":
-            # Cloaker: reencoda com CRF ligeiramente diferente + metadata limpa
-            # Isso gera um hash completamente diferente sem alterar qualidade visível
-            import random
-            crf_variado = 22 + random.randint(0, 3)  # 22-25, imperceptível
-            (
-                ffmpeg_python
-                .input(input_path)
-                .output(
-                    output_path,
-                    vcodec="libx264", crf=crf_variado, preset="fast",
-                    acodec="aac", audio_bitrate="128k",
-                    movflags="+faststart",
-                    map_metadata=-1,  # Remove todos os metadados
-                    metadata="title=",
-                    metadata_a="comment=",
-                )
-                .overwrite_output()
-                .run(quiet=True)
-            )
+            crf = str(22 + random.randint(0, 3))
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-c:v", "libx264", "-crf", crf, "-preset", "fast",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                "-map_metadata", "-1",
+                output_path
+            ]
 
         elif job.tipo == "cortar_video":
-            inicio = params.get("inicio", "00:00:00")   # HH:MM:SS
-            fim    = params.get("fim", None)             # HH:MM:SS ou None (até o final)
-            kwargs = {"ss": inicio, "acodec": "copy", "vcodec": "copy", "movflags": "+faststart"}
+            inicio = params.get("inicio", "00:00:00")
+            fim    = params.get("fim", "")
+            cmd = ["ffmpeg", "-y", "-ss", inicio, "-i", input_path]
             if fim:
-                kwargs["to"] = fim
-            (
-                ffmpeg_python
-                .input(input_path)
-                .output(output_path, **kwargs)
-                .overwrite_output()
-                .run(quiet=True)
-            )
+                cmd += ["-to", fim]
+            cmd += ["-c", "copy", "-movflags", "+faststart", output_path]
 
         elif job.tipo == "marca_dagua":
-            # Watermark de texto em vídeo usando drawtext
-            texto    = params.get("texto", "© Criativo")
+            texto    = params.get("texto", "� Criativo").replace("'", "\\'")
             posicao  = params.get("posicao", "bottom_right")
-            opacidade = float(params.get("opacidade", 0.7))
-
+            opacidade = float(params.get("opacidade", 70)) / 100.0
             pos_expr = {
                 "top_left":     "x=20:y=20",
                 "top_right":    "x=w-tw-20:y=20",
@@ -404,87 +372,87 @@ def _processar_video_sync(job_id: int):
                 "bottom_right": "x=w-tw-20:y=h-th-20",
                 "center":       "x=(w-tw)/2:y=(h-th)/2",
             }.get(posicao, "x=w-tw-20:y=h-th-20")
-
             drawtext = (
-                f"drawtext=text='{texto}':"
-                f"fontsize=36:fontcolor=white@{opacidade}:"
-                f"shadowx=2:shadowy=2:shadowcolor=black@{opacidade}:"
+                f"drawtext=text='{texto}':fontsize=36:"
+                f"fontcolor=white@{opacidade:.2f}:"
+                f"shadowx=2:shadowy=2:shadowcolor=black@{opacidade:.2f}:"
                 f"{pos_expr}"
             )
-            (
-                ffmpeg_python
-                .input(input_path)
-                .output(output_path, vf=drawtext, acodec="aac", vcodec="libx264",
-                        crf=23, preset="fast", movflags="+faststart")
-                .overwrite_output()
-                .run(quiet=True)
-            )
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", drawtext,
+                "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                "-c:a", "aac", "-movflags", "+faststart",
+                output_path
+            ]
 
         elif job.tipo == "processamento_completo":
-            # All-in-One: limpa metadados + reencoda + aplica hash único (cloaker)
-            import random
-            crf_variado = 22 + random.randint(0, 3)
-            (
-                ffmpeg_python
-                .input(input_path)
-                .output(
-                    output_path,
-                    vcodec="libx264", crf=crf_variado, preset="fast",
-                    acodec="aac", audio_bitrate="128k",
-                    movflags="+faststart",
-                    map_metadata=-1,
-                    metadata="title=",
-                )
-                .overwrite_output()
-                .run(quiet=True)
-            )
+            crf = str(22 + random.randint(0, 3))
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-c:v", "libx264", "-crf", crf, "-preset", "fast",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                "-map_metadata", "-1",
+                output_path
+            ]
 
         elif job.tipo == "gerador_preview":
-            # Gera preview censurado: blur pesado na região central do vídeo
             filtro_blur = (
                 "[0:v]split=2[original][blur];"
                 "[blur]crop=iw*0.6:ih*0.6:iw*0.2:ih*0.2,boxblur=20:20[blurred];"
                 "[original][blurred]overlay=iw*0.2:ih*0.2[out]"
             )
-            (
-                ffmpeg_python
-                .input(input_path)
-                .output(output_path, filter_complex=filtro_blur, map="[out]",
-                        acodec="aac", vcodec="libx264", crf=23, preset="fast",
-                        movflags="+faststart")
-                .overwrite_output()
-                .run(quiet=True)
-            )
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-filter_complex", filtro_blur,
+                "-map", "[out]",
+                "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                "-c:a", "aac", "-movflags", "+faststart",
+                output_path
+            ]
 
         elif job.tipo == "limpar_metadados":
-            # Remove metadados de vídeo/áudio sem reencoder (copy streams)
-            (
-                ffmpeg_python
-                .input(input_path)
-                .output(output_path, acodec="copy", vcodec="copy",
-                        map_metadata=-1, movflags="+faststart")
-                .overwrite_output()
-                .run(quiet=True)
-            )
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-c", "copy",
+                "-map_metadata", "-1",
+                "-movflags", "+faststart",
+                output_path
+            ]
 
         else:
-            raise ValueError(f"Tipo de job de vídeo desconhecido: {job.tipo}")
+            raise ValueError(f"Tipo de job desconhecido: {job.tipo}")
 
+        # Executa ffmpeg e captura stderr completo para log detalhado
+        _logger.info(f"🎬 [FERRAMENTAS] Job #{job_id} ({job.tipo}) iniciado")
+        resultado = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minutos máximo
+        )
+
+        if resultado.returncode != 0:
+            erro_detalhe = resultado.stderr[-2000:] if resultado.stderr else "sem saída de erro"
+            _logger.error(f"❌ [FERRAMENTAS] ffmpeg falhou (job #{job_id}):\n{erro_detalhe}")
+            raise RuntimeError(f"ffmpeg falhou (código {resultado.returncode}): {erro_detalhe[-500:]}")
+
+        _logger.info(f"✅ [FERRAMENTAS] Job #{job_id} concluído: {output_nome}")
         job.output_filename = output_nome
         job.status = "done"
         db.commit()
 
     except Exception as e:
+        import logging as _log2
+        _log2.getLogger("autopost").error(f"❌ [FERRAMENTAS] Erro job #{job_id}: {e}")
         if job:
             job.status = "error"
-            job.error_msg = str(e)
+            job.error_msg = str(e)[:1000]
             db.commit()
     finally:
         db.close()
-class TelegramRequestCode(BaseModel):
-    phone: str
-    api_id: str
-    api_hash: str
+
 
 class TelegramVerifyCode(BaseModel):
     code: str
