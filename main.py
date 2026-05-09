@@ -22,6 +22,26 @@ from telethon.errors import SessionPasswordNeededError
 from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination, AutopostAdmin, AutopostTopicMap, FerramentsJob, engine, Base
 from engine import start_engine, stop_engine, get_engine_status
 
+# ============================================================
+# 🔧 PATCH FFMPEG — static-ffmpeg (Railway Railpack)
+# O Railpack não preserva binários instalados via apt no build.
+# O pacote static-ffmpeg traz o binário embutido em Python e
+# o registra no PATH do processo via add_paths().
+# Isso garante que ffmpeg-python encontre o executável em
+# qualquer container, sem apt-get nem nixpacks.
+# ============================================================
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+    import logging as _ffmpeg_log
+    _ffmpeg_log.getLogger("autopost").info("✅ static-ffmpeg registrado no PATH.")
+except Exception as _e_sf:
+    import logging as _ffmpeg_log
+    _ffmpeg_log.getLogger("autopost").warning(
+        f"⚠️ static-ffmpeg não disponível ({_e_sf}). "
+        "Ferramentas de vídeo usarão ffmpeg do sistema se instalado."
+    )
+
 init_db()
 app = FastAPI(title="Zenyx AutoPost API", version="1.0")
 
