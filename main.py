@@ -22,17 +22,12 @@ from telethon.errors import SessionPasswordNeededError
 from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination, AutopostAdmin, AutopostTopicMap, FerramentsJob, engine, Base
 from engine import start_engine, stop_engine, get_engine_status
 
-# =============================================================
-# PATCH FFMPEG: static-ffmpeg garante o binario no Railway
-# =============================================================
 try:
     import static_ffmpeg
     static_ffmpeg.add_paths()
-    import logging as _sfl
-    _sfl.getLogger("autopost").info("static-ffmpeg registrado no PATH")
+    import logging as _sfl; _sfl.getLogger("autopost").info("static-ffmpeg OK")
 except Exception as _sfe:
-    import logging as _sfl
-    _sfl.getLogger("autopost").warning("static-ffmpeg indisponivel: " + str(_sfe))
+    import logging as _sfl; _sfl.getLogger("autopost").warning("static-ffmpeg: " + str(_sfe))
 
 init_db()
 app = FastAPI(title="Zenyx AutoPost API", version="1.0")
@@ -247,38 +242,43 @@ async def _processar_imagem_sync(job: FerramentsJob, db: Session):
             img.convert("RGB").save(output_path, quality=95, optimize=True, exif=b"")
 
         elif job.tipo == "marca_dagua":
-            # Adiciona marca d'água de texto ou imagem
             from PIL import ImageDraw, ImageFont
-            texto_wm  = params.get("texto", "© Criativo")
-            posicao   = params.get("posicao", "bottom_right")  # top_left, top_right, bottom_left, bottom_right, center
+            import base64 as _b64, io as _io
+            modo      = params.get("modo", "texto")
+            posicao   = params.get("posicao", "bottom_right")
             opacidade = int(params.get("opacidade", 70))
-
             img = Image.open(input_path).convert("RGBA")
             overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-            draw = ImageDraw.Draw(overlay)
-
-            try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
-            except Exception:
-                font = ImageFont.load_default()
-
-            bbox = draw.textbbox((0, 0), texto_wm, font=font)
-            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
             iw, ih = img.size
             margem = 20
 
-            pos_map = {
-                "top_left":     (margem, margem),
-                "top_right":    (iw - tw - margem, margem),
-                "bottom_left":  (margem, ih - th - margem),
-                "bottom_right": (iw - tw - margem, ih - th - margem),
-                "center":       ((iw - tw) // 2, (ih - th) // 2),
-            }
-            pos_xy = pos_map.get(posicao, pos_map["bottom_right"])
-
-            # Sombra sutil para legibilidade
-            draw.text((pos_xy[0]+2, pos_xy[1]+2), texto_wm, font=font, fill=(0, 0, 0, opacidade))
-            draw.text(pos_xy, texto_wm, font=font, fill=(255, 255, 255, opacidade))
+            if modo == "imagem" and params.get("wm_base64"):
+                escala = float(params.get("escala_wm", 20))
+                wm_img = Image.open(_io.BytesIO(_b64.b64decode(params["wm_base64"]))).convert("RGBA")
+                wm_w = int(iw * escala / 100)
+                wm_h = int(wm_w * wm_img.height / wm_img.width)
+                wm_img = wm_img.resize((wm_w, wm_h), Image.LANCZOS)
+                r2,g2,b2,a2 = wm_img.split()
+                a2 = a2.point(lambda x: int(x * opacidade / 100))
+                wm_img = Image.merge("RGBA",(r2,g2,b2,a2))
+                pos_wm = {"top_left":(margem,margem),"top_right":(iw-wm_w-margem,margem),"bottom_left":(margem,ih-wm_h-margem),"bottom_right":(iw-wm_w-margem,ih-wm_h-margem),"center":((iw-wm_w)//2,(ih-wm_h)//2)}
+                pos_xy = pos_wm.get(posicao, pos_wm["bottom_right"])
+                overlay.paste(wm_img, pos_xy, wm_img)
+            else:
+                texto_wm = params.get("texto", "© Criativo")
+                tamanho  = int(params.get("tamanho_fonte", 48))
+                draw = ImageDraw.Draw(overlay)
+                font = None
+                for fp in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf","/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"]:
+                    try: font = ImageFont.truetype(fp, tamanho); break
+                    except: pass
+                if not font: font = ImageFont.load_default()
+                bbox = draw.textbbox((0,0), texto_wm, font=font)
+                tw,th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+                pos_txt = {"top_left":(margem,margem),"top_right":(iw-tw-margem,margem),"bottom_left":(margem,ih-th-margem),"bottom_right":(iw-tw-margem,ih-th-margem),"center":((iw-tw)//2,(ih-th)//2)}
+                pos_xy = pos_txt.get(posicao, pos_txt["bottom_right"])
+                draw.text((pos_xy[0]+2,pos_xy[1]+2), texto_wm, font=font, fill=(0,0,0,opacidade))
+                draw.text(pos_xy, texto_wm, font=font, fill=(255,255,255,opacidade))
 
             resultado = Image.alpha_composite(img, overlay).convert("RGB")
             resultado.save(output_path, quality=95)
@@ -326,43 +326,117 @@ def _processar_video_sync(job_id: int):
         out  = caminho_completo(onom)
         p    = json.loads(job.parametros or "{}")
         cmd  = None
+
         if job.tipo == "conversor_proporcao":
             prop = p.get("proporcao", "9:16")
             filt = "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920" if prop == "9:16" else "crop=ih*3/4:ih:(iw-ih*3/4)/2:0,scale=1080:1440"
             cmd = ["ffmpeg","-y","-i",inp,"-vf",filt,"-c:v","libx264","-crf","23","-preset","fast","-c:a","aac","-movflags","+faststart",out]
+
         elif job.tipo == "cloaker_video":
             crf = str(22 + random.randint(0, 3))
             cmd = ["ffmpeg","-y","-i",inp,"-c:v","libx264","-crf",crf,"-preset","fast","-c:a","aac","-b:a","128k","-movflags","+faststart","-map_metadata","-1",out]
+
         elif job.tipo == "cortar_video":
             ini = p.get("inicio","00:00:00")
             fim = p.get("fim","")
             cmd = ["ffmpeg","-y","-ss",ini,"-i",inp]
             if fim: cmd += ["-to",fim]
             cmd += ["-c","copy","-movflags","+faststart",out]
+
         elif job.tipo == "marca_dagua":
-            texto = p.get("texto","© Criativo")
-            opac  = float(p.get("opacidade",70)) / 100.0
-            posm  = {"top_left":"x=20:y=20","top_right":"x=w-tw-20:y=20","bottom_left":"x=20:y=h-th-20","bottom_right":"x=w-tw-20:y=h-th-20","center":"x=(w-tw)/2:y=(h-th)/2"}
-            pexp  = posm.get(p.get("posicao","bottom_right"),"x=w-tw-20:y=h-th-20")
-            dt    = "drawtext=text='" + texto + "':fontsize=36:fontcolor=white@" + str(round(opac,2)) + ":shadowx=2:shadowy=2:shadowcolor=black@" + str(round(opac,2)) + ":" + pexp
-            cmd = ["ffmpeg","-y","-i",inp,"-vf",dt,"-c:v","libx264","-crf","23","-preset","fast","-c:a","aac","-movflags","+faststart",out]
+            modo    = p.get("modo","texto")
+            posicao = p.get("posicao","bottom_right")
+            opac    = float(p.get("opacidade",70)) / 100.0
+            pos_dt  = {
+                "top_left":     "x=20:y=20",
+                "top_right":    "x=w-tw-20:y=20",
+                "bottom_left":  "x=20:y=h-th-20",
+                "bottom_right": "x=w-tw-20:y=h-th-20",
+                "center":       "x=(w-tw)/2:y=(h-th)/2",
+            }.get(posicao, "x=w-tw-20:y=h-th-20")
+            pos_ov = {
+                "top_left":     "x=W*0.03:y=H*0.03",
+                "top_right":    "x=W-w-W*0.03:y=H*0.03",
+                "bottom_left":  "x=W*0.03:y=H-h-H*0.03",
+                "bottom_right": "x=W-w-W*0.03:y=H-h-H*0.03",
+                "center":       "x=(W-w)/2:y=(H-h)/2",
+            }.get(posicao, "x=W-w-W*0.03:y=H-h-H*0.03")
+
+            if modo == "imagem" and p.get("wm_base64"):
+                import base64 as _b64
+                wm_path = caminho_completo("wm_" + uuid.uuid4().hex + ".png")
+                with open(wm_path, "wb") as _wf:
+                    _wf.write(_b64.b64decode(p["wm_base64"]))
+                escala = float(p.get("escala_wm", 20))
+                vf = (
+                    "[1:v]scale=W*" + str(escala/100) + ":-1,"
+                    "format=rgba,colorchannelmixer=aa=" + str(round(opac,2)) + "[wm];"
+                    "[0:v][wm]overlay=" + pos_ov
+                )
+                cmd = ["ffmpeg","-y","-i",inp,"-i",wm_path,"-filter_complex",vf,
+                       "-c:v","libx264","-crf","23","-preset","fast","-c:a","aac",
+                       "-movflags","+faststart",out]
+            else:
+                texto   = p.get("texto","(c) Criativo")
+                tam     = int(p.get("tamanho_fonte", 48))
+                dt2 = ("drawtext=text='" + texto + "'"
+                       ":fontsize=" + str(tam) +
+                       ":fontcolor=white@" + str(round(opac,2)) +
+                       ":shadowx=2:shadowy=2:shadowcolor=black@" + str(round(opac,2)) +
+                       ":" + pos_dt)
+                cmd = ["ffmpeg","-y","-i",inp,"-vf",dt2,"-c:v","libx264","-crf","23",
+                       "-preset","fast","-c:a","aac","-movflags","+faststart",out]
+
         elif job.tipo == "processamento_completo":
             crf = str(22 + random.randint(0, 3))
-            cmd = ["ffmpeg","-y","-i",inp,"-c:v","libx264","-crf",crf,"-preset","fast","-c:a","aac","-b:a","128k","-movflags","+faststart","-map_metadata","-1",out]
+            cmd = ["ffmpeg","-y","-i",inp,"-c:v","libx264","-crf",crf,"-preset","fast",
+                   "-c:a","aac","-b:a","128k","-movflags","+faststart","-map_metadata","-1",out]
+
         elif job.tipo == "gerador_preview":
-            fb = "[0:v]split=2[orig][blur];[blur]crop=iw*0.6:ih*0.6:iw*0.2:ih*0.2,boxblur=20:20[blurred];[orig][blurred]overlay=iw*0.2:ih*0.2[out]"
-            cmd = ["ffmpeg","-y","-i",inp,"-filter_complex",fb,"-map","[out]","-c:v","libx264","-crf","23","-preset","fast","-c:a","aac","-movflags","+faststart",out]
+            # FIX v8: usa ffprobe para obter dimensoes reais e passa valores inteiros
+            # no overlay, evitando "Undefined constant" com expressoes como iw*0.2
+            probe = subprocess.run(
+                ["ffprobe","-v","quiet","-print_format","json","-show_streams",inp],
+                capture_output=True, text=True, timeout=30
+            )
+            vid_w, vid_h = 1080, 1920
+            if probe.returncode == 0:
+                import json as _j2
+                try:
+                    for s in _j2.loads(probe.stdout).get("streams",[]):
+                        if s.get("codec_type") == "video":
+                            vid_w = int(s.get("width", vid_w))
+                            vid_h = int(s.get("height", vid_h))
+                            break
+                except Exception: pass
+            cx = int(vid_w * 0.20)
+            cy = int(vid_h * 0.20)
+            cw = int(vid_w * 0.60)
+            ch = int(vid_h * 0.60)
+            fb = (
+                "[0:v]split=2[orig][blur];"
+                "[blur]crop=" + str(cw) + ":" + str(ch) + ":" + str(cx) + ":" + str(cy) + ","
+                "boxblur=20:20[blurred];"
+                "[orig][blurred]overlay=" + str(cx) + ":" + str(cy) + "[out]"
+            )
+            cmd = ["ffmpeg","-y","-i",inp,"-filter_complex",fb,"-map","[out]",
+                   "-c:v","libx264","-crf","23","-preset","fast","-c:a","aac",
+                   "-movflags","+faststart",out]
+
         elif job.tipo == "limpar_metadados":
-            cmd = ["ffmpeg","-y","-i",inp,"-c","copy","-map_metadata","-1","-movflags","+faststart",out]
+            cmd = ["ffmpeg","-y","-i",inp,"-c","copy","-map_metadata","-1",
+                   "-movflags","+faststart",out]
+
         else:
             raise ValueError("Tipo desconhecido: " + job.tipo)
+
         _log.info("[FERRAMENTAS] job#" + str(job_id) + " cmd=" + str(cmd[:5]))
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if res.returncode != 0:
             err = (res.stderr or "")[-2000:]
             _log.error("[FERRAMENTAS] ffmpeg erro job#" + str(job_id) + ": " + err)
             raise RuntimeError("ffmpeg falhou (" + str(res.returncode) + "): " + err[-500:])
-        _log.info("[FERRAMENTAS] job#" + str(job_id) + " ok: " + onom)
+        _log.info("[FERRAMENTAS] job#" + str(job_id) + " concluido")
         job.output_filename = onom
         job.status = "done"
         db.commit()
@@ -1350,25 +1424,17 @@ def download_ferramenta(
     token: str = None,
     credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False)),
 ):
-    """Download do arquivo. Aceita token via header Authorization OU query param ?token=...
-    Isso permite links diretos no browser sem precisar de JS para injetar o header."""
-    # Resolve token: header tem prioridade, fallback para query param
-    raw_token = None
-    if credentials and credentials.credentials:
-        raw_token = credentials.credentials
-    elif token:
-        raw_token = token
+    """Download via header Authorization OU query param ?token= (para links diretos)."""
+    raw_token = (credentials.credentials if credentials and credentials.credentials else None) or token
     if not raw_token:
         raise HTTPException(status_code=401, detail="Token nao fornecido.")
     try:
-        from jose import jwt, JWTError
-        payload = jwt.decode(raw_token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = str(payload.get("sub") or payload.get("id") or "")
-        if not user_id:
-            raise ValueError("user_id vazio")
+        from jose import jwt as _jwt
+        payload = _jwt.decode(raw_token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = str(payload.get("sub") or payload.get("id") or payload.get("user_id") or "")
+        if not user_id: raise ValueError("user_id vazio")
     except Exception:
         raise HTTPException(status_code=401, detail="Token invalido.")
-    # A partir daqui user_id esta validado
     job = db.query(FerramentsJob).filter(
         FerramentsJob.id == job_id,
         FerramentsJob.user_id == user_id,
