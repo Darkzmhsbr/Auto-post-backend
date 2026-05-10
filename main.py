@@ -22,6 +22,18 @@ from telethon.errors import SessionPasswordNeededError
 from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination, AutopostAdmin, AutopostTopicMap, FerramentsJob, engine, Base
 from engine import start_engine, stop_engine, get_engine_status
 
+# =============================================================
+# PATCH FFMPEG: static-ffmpeg garante o binario no Railway
+# =============================================================
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+    import logging as _sfl
+    _sfl.getLogger("autopost").info("static-ffmpeg registrado no PATH")
+except Exception as _sfe:
+    import logging as _sfl
+    _sfl.getLogger("autopost").warning("static-ffmpeg indisponivel: " + str(_sfe))
+
 init_db()
 app = FastAPI(title="Zenyx AutoPost API", version="1.0")
 
@@ -298,10 +310,7 @@ async def _processar_imagem_sync(job: FerramentsJob, db: Session):
 
 
 def _processar_video_sync(job_id: int):
-    """Processamento de video em thread separada via subprocess."""
-    import subprocess
-    import random
-    import logging
+    import subprocess, random, logging
     _log = logging.getLogger("autopost")
     db = SessionLocal()
     job = None
@@ -311,55 +320,54 @@ def _processar_video_sync(job_id: int):
             return
         job.status = "processing"
         db.commit()
-        input_path  = caminho_completo(job.input_filename)
-        ext_in      = get_extensao(job.input_filename)
-        output_nome = uuid.uuid4().hex + ext_in
-        output_path = caminho_completo(output_nome)
-        params      = json.loads(job.parametros or "{}")
-        cmd = None
+        inp  = caminho_completo(job.input_filename)
+        ext  = get_extensao(job.input_filename)
+        onom = uuid.uuid4().hex + ext
+        out  = caminho_completo(onom)
+        p    = json.loads(job.parametros or "{}")
+        cmd  = None
         if job.tipo == "conversor_proporcao":
-            proporcao = params.get("proporcao", "9:16")
-            filtro = "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920" if proporcao == "9:16" else "crop=ih*3/4:ih:(iw-ih*3/4)/2:0,scale=1080:1440"
-            cmd = ["ffmpeg", "-y", "-i", input_path, "-vf", filtro, "-c:v", "libx264", "-crf", "23", "-preset", "fast", "-c:a", "aac", "-movflags", "+faststart", output_path]
+            prop = p.get("proporcao", "9:16")
+            filt = "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920" if prop == "9:16" else "crop=ih*3/4:ih:(iw-ih*3/4)/2:0,scale=1080:1440"
+            cmd = ["ffmpeg","-y","-i",inp,"-vf",filt,"-c:v","libx264","-crf","23","-preset","fast","-c:a","aac","-movflags","+faststart",out]
         elif job.tipo == "cloaker_video":
             crf = str(22 + random.randint(0, 3))
-            cmd = ["ffmpeg", "-y", "-i", input_path, "-c:v", "libx264", "-crf", crf, "-preset", "fast", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-map_metadata", "-1", output_path]
+            cmd = ["ffmpeg","-y","-i",inp,"-c:v","libx264","-crf",crf,"-preset","fast","-c:a","aac","-b:a","128k","-movflags","+faststart","-map_metadata","-1",out]
         elif job.tipo == "cortar_video":
-            inicio = params.get("inicio", "00:00:00")
-            fim    = params.get("fim", "")
-            cmd = ["ffmpeg", "-y", "-ss", inicio, "-i", input_path]
-            if fim:
-                cmd += ["-to", fim]
-            cmd += ["-c", "copy", "-movflags", "+faststart", output_path]
+            ini = p.get("inicio","00:00:00")
+            fim = p.get("fim","")
+            cmd = ["ffmpeg","-y","-ss",ini,"-i",inp]
+            if fim: cmd += ["-to",fim]
+            cmd += ["-c","copy","-movflags","+faststart",out]
         elif job.tipo == "marca_dagua":
-            texto    = params.get("texto", "© Criativo")
-            posicao  = params.get("posicao", "bottom_right")
-            opacidade = float(params.get("opacidade", 70)) / 100.0
-            pos_map  = {"top_left": "x=20:y=20", "top_right": "x=w-tw-20:y=20", "bottom_left": "x=20:y=h-th-20", "bottom_right": "x=w-tw-20:y=h-th-20", "center": "x=(w-tw)/2:y=(h-th)/2"}
-            pos_expr = pos_map.get(posicao, "x=w-tw-20:y=h-th-20")
-            drawtext = "drawtext=text='" + texto + "':fontsize=36:fontcolor=white@" + f"{opacidade:.2f}" + ":shadowx=2:shadowy=2:shadowcolor=black@" + f"{opacidade:.2f}" + ":" + pos_expr
-            cmd = ["ffmpeg", "-y", "-i", input_path, "-vf", drawtext, "-c:v", "libx264", "-crf", "23", "-preset", "fast", "-c:a", "aac", "-movflags", "+faststart", output_path]
+            texto = p.get("texto","© Criativo")
+            opac  = float(p.get("opacidade",70)) / 100.0
+            posm  = {"top_left":"x=20:y=20","top_right":"x=w-tw-20:y=20","bottom_left":"x=20:y=h-th-20","bottom_right":"x=w-tw-20:y=h-th-20","center":"x=(w-tw)/2:y=(h-th)/2"}
+            pexp  = posm.get(p.get("posicao","bottom_right"),"x=w-tw-20:y=h-th-20")
+            dt    = "drawtext=text='" + texto + "':fontsize=36:fontcolor=white@" + str(round(opac,2)) + ":shadowx=2:shadowy=2:shadowcolor=black@" + str(round(opac,2)) + ":" + pexp
+            cmd = ["ffmpeg","-y","-i",inp,"-vf",dt,"-c:v","libx264","-crf","23","-preset","fast","-c:a","aac","-movflags","+faststart",out]
         elif job.tipo == "processamento_completo":
             crf = str(22 + random.randint(0, 3))
-            cmd = ["ffmpeg", "-y", "-i", input_path, "-c:v", "libx264", "-crf", crf, "-preset", "fast", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-map_metadata", "-1", output_path]
+            cmd = ["ffmpeg","-y","-i",inp,"-c:v","libx264","-crf",crf,"-preset","fast","-c:a","aac","-b:a","128k","-movflags","+faststart","-map_metadata","-1",out]
         elif job.tipo == "gerador_preview":
             fb = "[0:v]split=2[orig][blur];[blur]crop=iw*0.6:ih*0.6:iw*0.2:ih*0.2,boxblur=20:20[blurred];[orig][blurred]overlay=iw*0.2:ih*0.2[out]"
-            cmd = ["ffmpeg", "-y", "-i", input_path, "-filter_complex", fb, "-map", "[out]", "-c:v", "libx264", "-crf", "23", "-preset", "fast", "-c:a", "aac", "-movflags", "+faststart", output_path]
+            cmd = ["ffmpeg","-y","-i",inp,"-filter_complex",fb,"-map","[out]","-c:v","libx264","-crf","23","-preset","fast","-c:a","aac","-movflags","+faststart",out]
         elif job.tipo == "limpar_metadados":
-            cmd = ["ffmpeg", "-y", "-i", input_path, "-c", "copy", "-map_metadata", "-1", "-movflags", "+faststart", output_path]
+            cmd = ["ffmpeg","-y","-i",inp,"-c","copy","-map_metadata","-1","-movflags","+faststart",out]
         else:
-            raise ValueError("Tipo de job desconhecido: " + job.tipo)
-        _log.info("[FERRAMENTAS] Job #" + str(job_id) + " iniciado: " + str(cmd[:4]))
-        resultado = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if resultado.returncode != 0:
-            erro = (resultado.stderr or "sem saida")[-2000:]
-            _log.error("[FERRAMENTAS] ffmpeg falhou job #" + str(job_id) + ": " + erro)
-            raise RuntimeError("ffmpeg falhou (codigo " + str(resultado.returncode) + "): " + erro[-500:])
-        _log.info("[FERRAMENTAS] Job #" + str(job_id) + " concluido: " + output_nome)
-        job.output_filename = output_nome
+            raise ValueError("Tipo desconhecido: " + job.tipo)
+        _log.info("[FERRAMENTAS] job#" + str(job_id) + " cmd=" + str(cmd[:5]))
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if res.returncode != 0:
+            err = (res.stderr or "")[-2000:]
+            _log.error("[FERRAMENTAS] ffmpeg erro job#" + str(job_id) + ": " + err)
+            raise RuntimeError("ffmpeg falhou (" + str(res.returncode) + "): " + err[-500:])
+        _log.info("[FERRAMENTAS] job#" + str(job_id) + " ok: " + onom)
+        job.output_filename = onom
         job.status = "done"
         db.commit()
     except Exception as e:
+        _log.error("[FERRAMENTAS] excecao job#" + str(job_id) + ": " + str(e))
         if job:
             job.status = "error"
             job.error_msg = str(e)[:1000]
@@ -1338,10 +1346,29 @@ def status_ferramenta(
 @app.get("/api/ferramentas/download/{job_id}")
 def download_ferramenta(
     job_id: int,
-    user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
+    token: str = None,
+    credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False)),
 ):
-    """Faz download do arquivo processado. Só disponível quando status='done'."""
+    """Download do arquivo. Aceita token via header Authorization OU query param ?token=...
+    Isso permite links diretos no browser sem precisar de JS para injetar o header."""
+    # Resolve token: header tem prioridade, fallback para query param
+    raw_token = None
+    if credentials and credentials.credentials:
+        raw_token = credentials.credentials
+    elif token:
+        raw_token = token
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Token nao fornecido.")
+    try:
+        from jose import jwt, JWTError
+        payload = jwt.decode(raw_token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = str(payload.get("sub") or payload.get("id") or "")
+        if not user_id:
+            raise ValueError("user_id vazio")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token invalido.")
+    # A partir daqui user_id esta validado
     job = db.query(FerramentsJob).filter(
         FerramentsJob.id == job_id,
         FerramentsJob.user_id == user_id,
