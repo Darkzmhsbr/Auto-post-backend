@@ -250,34 +250,53 @@ async def _processar_imagem_sync(job: FerramentsJob, db: Session):
             img = Image.open(input_path).convert("RGBA")
             overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
             iw, ih = img.size
-            margem = 20
+            margem = max(10, int(iw * 0.02))
 
             if modo == "imagem" and params.get("wm_base64"):
                 escala = float(params.get("escala_wm", 20))
                 wm_img = Image.open(_io.BytesIO(_b64.b64decode(params["wm_base64"]))).convert("RGBA")
-                wm_w = int(iw * escala / 100)
+                wm_w = max(20, int(iw * escala / 100))
                 wm_h = int(wm_w * wm_img.height / wm_img.width)
                 wm_img = wm_img.resize((wm_w, wm_h), Image.LANCZOS)
                 r2,g2,b2,a2 = wm_img.split()
                 a2 = a2.point(lambda x: int(x * opacidade / 100))
                 wm_img = Image.merge("RGBA",(r2,g2,b2,a2))
-                pos_wm = {"top_left":(margem,margem),"top_right":(iw-wm_w-margem,margem),"bottom_left":(margem,ih-wm_h-margem),"bottom_right":(iw-wm_w-margem,ih-wm_h-margem),"center":((iw-wm_w)//2,(ih-wm_h)//2)}
+                pos_wm = {
+                    "top_left":(margem,margem),
+                    "top_right":(iw-wm_w-margem,margem),
+                    "bottom_left":(margem,ih-wm_h-margem),
+                    "bottom_right":(iw-wm_w-margem,ih-wm_h-margem),
+                    "center":((iw-wm_w)//2,(ih-wm_h)//2),
+                }
                 pos_xy = pos_wm.get(posicao, pos_wm["bottom_right"])
                 overlay.paste(wm_img, pos_xy, wm_img)
             else:
+                # Tamanho proporcional: pct da altura da imagem (ex: 8% de 1920 = 154px)
                 texto_wm = params.get("texto", "© Criativo")
-                tamanho  = int(params.get("tamanho_fonte", 48))
+                pct = float(params.get("tamanho_fonte", 8))
+                tamanho = max(20, int(ih * pct / 100))
                 draw = ImageDraw.Draw(overlay)
                 font = None
-                for fp in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf","/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"]:
+                for fp in [
+                    "/tmp/ferramentas/DejaVuSans-Bold.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                ]:
                     try: font = ImageFont.truetype(fp, tamanho); break
                     except: pass
                 if not font: font = ImageFont.load_default()
                 bbox = draw.textbbox((0,0), texto_wm, font=font)
                 tw,th = bbox[2]-bbox[0], bbox[3]-bbox[1]
-                pos_txt = {"top_left":(margem,margem),"top_right":(iw-tw-margem,margem),"bottom_left":(margem,ih-th-margem),"bottom_right":(iw-tw-margem,ih-th-margem),"center":((iw-tw)//2,(ih-th)//2)}
+                pos_txt = {
+                    "top_left":(margem,margem),
+                    "top_right":(iw-tw-margem,margem),
+                    "bottom_left":(margem,ih-th-margem),
+                    "bottom_right":(iw-tw-margem,ih-th-margem),
+                    "center":((iw-tw)//2,(ih-th)//2),
+                }
                 pos_xy = pos_txt.get(posicao, pos_txt["bottom_right"])
-                draw.text((pos_xy[0]+2,pos_xy[1]+2), texto_wm, font=font, fill=(0,0,0,opacidade))
+                # Sombra para contraste
+                draw.text((pos_xy[0]+3,pos_xy[1]+3), texto_wm, font=font, fill=(0,0,0,min(255,opacidade+50)))
                 draw.text(pos_xy, texto_wm, font=font, fill=(255,255,255,opacidade))
 
             resultado = Image.alpha_composite(img, overlay).convert("RGB")
@@ -310,10 +329,25 @@ async def _processar_imagem_sync(job: FerramentsJob, db: Session):
 
 
 def _processar_video_sync(job_id: int):
-    import subprocess, random, logging
+    import subprocess, random, logging, os as _os, base64 as _b64
     _log = logging.getLogger("autopost")
     db = SessionLocal()
     job = None
+
+    # Garante que a fonte TTF existe no container (necessario para drawtext)
+    FONTE_PATH = "/tmp/ferramentas/DejaVuSans-Bold.ttf"
+    if not _os.path.exists(FONTE_PATH):
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(
+                "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
+                FONTE_PATH
+            )
+            _log.info("[FERRAMENTAS] Fonte DejaVuSans-Bold.ttf baixada em " + FONTE_PATH)
+        except Exception as _fe:
+            _log.warning("[FERRAMENTAS] Nao foi possivel baixar fonte: " + str(_fe))
+            FONTE_PATH = None
+
     try:
         job = db.query(FerramentsJob).filter(FerramentsJob.id == job_id).first()
         if not job or job.status != "pending":
@@ -347,29 +381,39 @@ def _processar_video_sync(job_id: int):
             modo    = p.get("modo","texto")
             posicao = p.get("posicao","bottom_right")
             opac    = float(p.get("opacidade",70)) / 100.0
-            pos_dt  = {
-                "top_left":     "x=20:y=20",
-                "top_right":    "x=w-tw-20:y=20",
-                "bottom_left":  "x=20:y=h-th-20",
-                "bottom_right": "x=w-tw-20:y=h-th-20",
-                "center":       "x=(w-tw)/2:y=(h-th)/2",
-            }.get(posicao, "x=w-tw-20:y=h-th-20")
-            pos_ov = {
-                "top_left":     "x=W*0.03:y=H*0.03",
-                "top_right":    "x=W-w-W*0.03:y=H*0.03",
-                "bottom_left":  "x=W*0.03:y=H-h-H*0.03",
-                "bottom_right": "x=W-w-W*0.03:y=H-h-H*0.03",
-                "center":       "x=(W-w)/2:y=(H-h)/2",
-            }.get(posicao, "x=W-w-W*0.03:y=H-h-H*0.03")
+
+            # Obter dimensoes do video para calcular tamanho proporcional
+            vid_w, vid_h = 1080, 1920
+            try:
+                probe = subprocess.run(
+                    ["ffprobe","-v","quiet","-print_format","json","-show_streams",inp],
+                    capture_output=True, text=True, timeout=15
+                )
+                if probe.returncode == 0:
+                    import json as _j
+                    for s in _j.loads(probe.stdout).get("streams",[]):
+                        if s.get("codec_type") == "video":
+                            vid_w = int(s.get("width", vid_w))
+                            vid_h = int(s.get("height", vid_h))
+                            break
+            except Exception: pass
 
             if modo == "imagem" and p.get("wm_base64"):
-                import base64 as _b64
+                # Marca dagua por imagem PNG
                 wm_path = caminho_completo("wm_" + uuid.uuid4().hex + ".png")
                 with open(wm_path, "wb") as _wf:
                     _wf.write(_b64.b64decode(p["wm_base64"]))
                 escala = float(p.get("escala_wm", 20))
+                wm_px = int(vid_w * escala / 100)
+                pos_ov = {
+                    "top_left":     "x=W*0.03:y=H*0.03",
+                    "top_right":    "x=W-w-W*0.03:y=H*0.03",
+                    "bottom_left":  "x=W*0.03:y=H-h-H*0.03",
+                    "bottom_right": "x=W-w-W*0.03:y=H-h-H*0.03",
+                    "center":       "x=(W-w)/2:y=(H-h)/2",
+                }.get(posicao, "x=W-w-W*0.03:y=H-h-H*0.03")
                 vf = (
-                    "[1:v]scale=W*" + str(escala/100) + ":-1,"
+                    "[1:v]scale=" + str(wm_px) + ":-1,"
                     "format=rgba,colorchannelmixer=aa=" + str(round(opac,2)) + "[wm];"
                     "[0:v][wm]overlay=" + pos_ov
                 )
@@ -377,14 +421,33 @@ def _processar_video_sync(job_id: int):
                        "-c:v","libx264","-crf","23","-preset","fast","-c:a","aac",
                        "-movflags","+faststart",out]
             else:
-                texto   = p.get("texto","(c) Criativo")
-                tam     = int(p.get("tamanho_fonte", 48))
-                dt2 = ("drawtext=text='" + texto + "'"
-                       ":fontsize=" + str(tam) +
-                       ":fontcolor=white@" + str(round(opac,2)) +
-                       ":shadowx=2:shadowy=2:shadowcolor=black@" + str(round(opac,2)) +
-                       ":" + pos_dt)
-                cmd = ["ffmpeg","-y","-i",inp,"-vf",dt2,"-c:v","libx264","-crf","23",
+                # Marca dagua por texto com fonte explícita (sem Fontconfig)
+                texto   = p.get("texto","(c) Criativo").replace("'","\\'").replace(":",r"\:").replace("\\","\\\\")
+                # Tamanho proporcional: usuario define % da altura do video (1-100)
+                # Ex: tamanho_fonte=8 -> 8% da altura -> para 1920px = 154px (bem visivel)
+                pct = float(p.get("tamanho_fonte", 8))
+                fontsize = max(20, int(vid_h * pct / 100))
+
+                pos_dt = {
+                    "top_left":     "x=20:y=20",
+                    "top_right":    "x=w-tw-20:y=20",
+                    "bottom_left":  "x=20:y=h-th-20",
+                    "bottom_right": "x=w-tw-20:y=h-th-20",
+                    "center":       "x=(w-tw)/2:y=(h-th)/2",
+                }.get(posicao, "x=w-tw-20:y=h-th-20")
+
+                dt_parts = [
+                    "drawtext=text='" + texto + "'",
+                    "fontsize=" + str(fontsize),
+                    "fontcolor=white@" + str(round(opac,2)),
+                    "shadowx=3:shadowy=3",
+                    "shadowcolor=black@" + str(round(min(opac+0.2,1.0),2)),
+                    pos_dt,
+                ]
+                if FONTE_PATH and _os.path.exists(FONTE_PATH):
+                    dt_parts.insert(1, "fontfile=" + FONTE_PATH)
+                dt = ":".join(dt_parts)
+                cmd = ["ffmpeg","-y","-i",inp,"-vf",dt,"-c:v","libx264","-crf","23",
                        "-preset","fast","-c:a","aac","-movflags","+faststart",out]
 
         elif job.tipo == "processamento_completo":
@@ -393,26 +456,21 @@ def _processar_video_sync(job_id: int):
                    "-c:a","aac","-b:a","128k","-movflags","+faststart","-map_metadata","-1",out]
 
         elif job.tipo == "gerador_preview":
-            # FIX v8: usa ffprobe para obter dimensoes reais e passa valores inteiros
-            # no overlay, evitando "Undefined constant" com expressoes como iw*0.2
-            probe = subprocess.run(
+            # Usa ffprobe para dimensoes reais e passa valores inteiros (fix ffmpeg v8)
+            vid_w2, vid_h2 = 1080, 1920
+            probe2 = subprocess.run(
                 ["ffprobe","-v","quiet","-print_format","json","-show_streams",inp],
-                capture_output=True, text=True, timeout=30
+                capture_output=True, text=True, timeout=15
             )
-            vid_w, vid_h = 1080, 1920
-            if probe.returncode == 0:
-                import json as _j2
+            if probe2.returncode == 0:
+                import json as _j3
                 try:
-                    for s in _j2.loads(probe.stdout).get("streams",[]):
+                    for s in _j3.loads(probe2.stdout).get("streams",[]):
                         if s.get("codec_type") == "video":
-                            vid_w = int(s.get("width", vid_w))
-                            vid_h = int(s.get("height", vid_h))
-                            break
+                            vid_w2 = int(s.get("width",vid_w2)); vid_h2 = int(s.get("height",vid_h2)); break
                 except Exception: pass
-            cx = int(vid_w * 0.20)
-            cy = int(vid_h * 0.20)
-            cw = int(vid_w * 0.60)
-            ch = int(vid_h * 0.60)
+            cx = int(vid_w2*0.20); cy = int(vid_h2*0.20)
+            cw = int(vid_w2*0.60); ch = int(vid_h2*0.60)
             fb = (
                 "[0:v]split=2[orig][blur];"
                 "[blur]crop=" + str(cw) + ":" + str(ch) + ":" + str(cx) + ":" + str(cy) + ","
@@ -424,8 +482,7 @@ def _processar_video_sync(job_id: int):
                    "-movflags","+faststart",out]
 
         elif job.tipo == "limpar_metadados":
-            cmd = ["ffmpeg","-y","-i",inp,"-c","copy","-map_metadata","-1",
-                   "-movflags","+faststart",out]
+            cmd = ["ffmpeg","-y","-i",inp,"-c","copy","-map_metadata","-1","-movflags","+faststart",out]
 
         else:
             raise ValueError("Tipo desconhecido: " + job.tipo)
