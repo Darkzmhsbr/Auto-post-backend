@@ -246,10 +246,27 @@ def _fazer_login_instagram(ig_username: str, ig_password: str, proxy_url: str = 
     Faz login no Instagram via instagrapi.
     Retorna (client, session_json, device_json) em caso de sucesso.
     Lança exceção com mensagem adequada em caso de erro.
+
+    Exceções mapeadas:
+    - ChallengeRequired  → Instagram pediu verificação (email/SMS)
+    - BadPassword        → senha errada
+    - TwoFactorRequired  → 2FA ativado na conta
+    - FeedbackRequired   → conta bloqueada/suspensa temporariamente pelo Instagram
+    - LoginRequired      → sessão inválida ou conta desativada
+    - PleaseWaitFewMinutes → rate limit do Instagram (muitas tentativas)
+    - Exception genérica → outro erro, mensagem repassada ao frontend
     """
     try:
         from instagrapi import Client
-        from instagrapi.exceptions import ChallengeRequired, BadPassword, TwoFactorRequired
+        from instagrapi.exceptions import (
+            ChallengeRequired,
+            BadPassword,
+            TwoFactorRequired,
+            FeedbackRequired,
+            LoginRequired,
+            PleaseWaitFewMinutes,
+            ReloginAttemptExceeded,
+        )
     except ImportError:
         raise RuntimeError("A biblioteca 'instagrapi' não está instalada. Verifique o requirements.txt.")
 
@@ -259,28 +276,54 @@ def _fazer_login_instagram(ig_username: str, ig_password: str, proxy_url: str = 
     if proxy_url:
         cl.set_proxy(proxy_url)
 
-    # Gera device fingerprint único para esta conta
+    # Device fingerprint e locale brasileiros
     cl.set_locale("pt_BR")
     cl.set_timezone_offset(-10800)  # UTC-3 (Brasília)
 
+    # Desativa relogin automático para não mascarar erros
+    cl.handle_exception = lambda client, e: (_ for _ in ()).throw(e)
+
     try:
         cl.login(ig_username, ig_password)
-    except ChallengeRequired:
-        # Challenge pendente — retorna o client para que o frontend possa confirmar o código
-        raise ChallengeRequired("challenge_required")
-    except BadPassword:
-        raise ValueError("Senha incorreta para esta conta do Instagram.")
-    except TwoFactorRequired:
-        raise ValueError("Esta conta tem 2FA ativado. Desative temporariamente para vincular.")
-    except Exception as e:
-        raise RuntimeError(f"Erro ao fazer login: {str(e)}")
 
-    session_json  = cl.get_settings()
-    device_json   = json.dumps({
-        "device_type": cl.device_type,
-        "user_agent": cl.user_agent,
+    except ChallengeRequired:
+        raise ChallengeRequired("challenge_required")
+
+    except BadPassword:
+        raise ValueError("Senha incorreta. Verifique e tente novamente.")
+
+    except TwoFactorRequired:
+        raise ValueError("Esta conta tem verificação em duas etapas ativada. Desative temporariamente no app do Instagram e tente novamente.")
+
+    except FeedbackRequired as e:
+        raise RuntimeError(f"O Instagram bloqueou temporariamente esta conta. Abra o app e resolva o aviso pendente, depois tente novamente. Detalhe: {str(e)[:200]}")
+
+    except LoginRequired as e:
+        raise RuntimeError(f"O Instagram recusou o login. A conta pode estar desativada ou com restrições. Detalhe: {str(e)[:200]}")
+
+    except PleaseWaitFewMinutes:
+        raise RuntimeError("O Instagram está com rate limit ativo. Aguarde alguns minutos e tente novamente.")
+
+    except ReloginAttemptExceeded:
+        raise RuntimeError("Muitas tentativas de login. Aguarde alguns minutos antes de tentar novamente.")
+
+    except Exception as e:
+        erro_str = str(e)
+        raise RuntimeError(f"Erro ao fazer login: {erro_str}")
+
+    # Serializa sessão e device
+    try:
+        session_dict = cl.get_settings()
+        session_json = json.dumps(session_dict)
+    except Exception as e:
+        raise RuntimeError(f"Login OK mas erro ao salvar sessão: {str(e)}")
+
+    device_json = json.dumps({
+        "device_type": getattr(cl, "device_type", "unknown"),
+        "user_agent":  getattr(cl, "user_agent",  "unknown"),
     })
-    return cl, json.dumps(session_json), device_json
+
+    return cl, session_json, device_json
 
 
 def _executar_post(post_id: int):
@@ -489,8 +532,10 @@ async def vincular_conta(
     except Exception as e:
         nova_conta.login_status = "error"
         db.commit()
-        _registrar_log(db, user_id, "login_error", nova_conta.id, {"error": str(e)[:300]})
-        raise HTTPException(status_code=400, detail=str(e))
+        erro_msg = str(e)
+        logger.error(f"[INSTAGRAM] Erro ao vincular conta '{conta.ig_username}': {erro_msg}")
+        _registrar_log(db, user_id, "login_error", nova_conta.id, {"error": erro_msg[:300]})
+        raise HTTPException(status_code=400, detail=erro_msg)
 
 
 @router.post("/accounts/{account_id}/verify", summary="Confirma código de challenge do Instagram")
