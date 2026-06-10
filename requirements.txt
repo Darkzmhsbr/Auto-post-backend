@@ -16,3 +16,6 @@ static-ffmpeg>=2.5
 piexif>=1.1.3
 mutagen>=1.47.0
 python-multipart>=0.0.9
+# ── Instagram Farm ────────────────────────────────────
+instagrapi>=2.0.0
+httpx[socks]>=0.24.0

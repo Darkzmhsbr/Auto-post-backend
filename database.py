@@ -193,5 +193,99 @@ class FerramentsJob(Base):
     updated_at  = Column(DateTime, default=now_brazil, onupdate=now_brazil)
 
 
+# ==========================================
+# 👇 NOVAS TABELAS: INSTAGRAM FARM
+# ==========================================
+
+class InstagramAccount(Base):
+    """
+    Uma row por conta Instagram vinculada pelo usuário.
+    A sessão é salva em session_data (BYTEA) para reutilizar sem login repetido.
+    O device_json armazena o fingerprint único da conta (modelo, versão do app, etc).
+    A senha NÃO é salva em texto puro — só a sessão criptografada é persistida.
+    """
+    __tablename__ = "instagram_accounts"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    user_id         = Column(String, nullable=False, index=True)   # owner (SSO)
+    ig_username     = Column(String(100), nullable=False)          # @ da conta
+    # Sessão serializada pelo instagrapi (JSON criptografado via Fernet)
+    session_data    = Column(BYTEA, nullable=True)
+    # Proxy exclusivo desta conta — formato: socks5://user:pass@host:port
+    # ou http://user:pass@host:port. NULL = sem proxy (não recomendado em produção).
+    proxy_url       = Column(Text, nullable=True)
+    # Fingerprint do dispositivo simulado (JSON com model, android_version, etc.)
+    device_json     = Column(Text, nullable=True)
+    is_active       = Column(Boolean, default=True)
+    # Status do último login: 'ok', 'challenge_required', 'bad_password', 'error'
+    login_status    = Column(String(30), default='pending')
+    last_login_at   = Column(DateTime, nullable=True)
+    created_at      = Column(DateTime, default=now_brazil)
+
+    posts = relationship("InstagramPost", back_populates="account", cascade="all, delete-orphan")
+    logs  = relationship("InstagramLog",  back_populates="account", cascade="all, delete-orphan")
+
+
+class InstagramPost(Base):
+    """
+    Fila de posts agendados para uma conta Instagram.
+    O scheduler verifica a cada minuto por posts com status='pending'
+    e scheduled_for <= agora, e executa via instagrapi.
+
+    Fluxo de status: pending → processing → done | error
+    """
+    __tablename__ = "instagram_posts"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    account_id      = Column(Integer, ForeignKey("instagram_accounts.id"), nullable=False)
+    user_id         = Column(String, nullable=False, index=True)   # owner (redundante para queries rápidas)
+
+    # Tipo do post: 'photo', 'video', 'reel', 'story_photo', 'story_video', 'carousel'
+    post_type       = Column(String(20), nullable=False, default="photo")
+    # Legenda do post (texto puro, sem HTML)
+    caption         = Column(Text, nullable=True)
+    # Nome do arquivo de mídia salvo em /tmp/ferramentas/ (mesmo diretório das ferramentas)
+    media_filename  = Column(String(255), nullable=True)
+
+    # Agendamento
+    scheduled_for   = Column(DateTime, nullable=False)
+
+    # Controle de estado
+    status          = Column(String(20), default="pending", index=True)
+    # 'pending'    → aguardando execução
+    # 'processing' → sendo executado agora
+    # 'done'       → publicado com sucesso
+    # 'error'      → falhou, ver error_msg
+
+    sent_at         = Column(DateTime, nullable=True)
+    error_msg       = Column(Text, nullable=True)
+    # ID do post no Instagram após publicação bem-sucedida
+    ig_media_id     = Column(String(100), nullable=True)
+
+    created_at      = Column(DateTime, default=now_brazil)
+
+    account = relationship("InstagramAccount", back_populates="posts")
+
+
+class InstagramLog(Base):
+    """
+    Histórico de ações por conta Instagram.
+    Registra logins, posts, erros, desconexões, etc.
+    Segue o mesmo padrão do AutopostLog.
+    """
+    __tablename__ = "instagram_logs"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    user_id     = Column(String, nullable=False, index=True)
+    account_id  = Column(Integer, ForeignKey("instagram_accounts.id"), nullable=True)
+    # Ação: 'login', 'login_challenge', 'post_done', 'post_error', 'account_added',
+    #        'account_removed', 'session_refreshed', 'proxy_updated'
+    action      = Column(String(50), nullable=False)
+    details     = Column(JSONB, nullable=True)
+    created_at  = Column(DateTime, default=now_brazil, index=True)
+
+    account = relationship("InstagramAccount", back_populates="logs")
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)

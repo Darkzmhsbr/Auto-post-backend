@@ -22,6 +22,12 @@ from telethon.errors import SessionPasswordNeededError
 from database import init_db, SessionLocal, AutopostChannel, AutopostSession, AutopostBot, AutopostQueue, AutopostLog, AutopostDestination, AutopostAdmin, AutopostTopicMap, FerramentsJob, engine, Base
 from engine import start_engine, stop_engine, get_engine_status
 
+# ── Instagram Farm ────────────────────────────────────────────────────────────
+# Módulo separado para não misturar com a lógica do Telegram/AutoPost.
+# Todas as rotas ficam em instagram.py sob o prefixo /api/instagram/
+from instagram import router as instagram_router
+from instagram import processar_posts_pendentes
+
 try:
     import static_ffmpeg
     static_ffmpeg.add_paths()
@@ -49,10 +55,29 @@ app = FastAPI(title="Zenyx AutoPost API", version="1.0")
 @app.on_event("startup")
 async def on_startup():
     start_engine()  # Captura o event loop do uvicorn aqui
+    # ── Instagram Farm: job de posts agendados (roda a cada 1 minuto) ──
+    from apscheduler.schedulers.background import BackgroundScheduler
+    _insta_scheduler = BackgroundScheduler(timezone="America/Sao_Paulo")
+    _insta_scheduler.add_job(
+        processar_posts_pendentes,
+        trigger="interval",
+        minutes=1,
+        id="instagram_posts_job",
+        replace_existing=True,
+        max_instances=1,
+    )
+    _insta_scheduler.start()
+    app.state.insta_scheduler = _insta_scheduler
 
 @app.on_event("shutdown")
 async def on_shutdown():
     stop_engine()
+    # Para o scheduler do Instagram Farm
+    try:
+        if hasattr(app.state, "insta_scheduler") and app.state.insta_scheduler.running:
+            app.state.insta_scheduler.shutdown(wait=False)
+    except Exception:
+        pass
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,6 +92,9 @@ SECRET_KEY = os.getenv("SECRET_KEY", "chave-secreta-padrao")
 ALGORITHM = "HS256"
 
 pending_logins = {}
+
+# Registra o módulo Instagram Farm
+app.include_router(instagram_router)
 
 # ==========================================
 # CONFIGURAÇÃO — FERRAMENTAS DE CRIATIVOS
@@ -1590,6 +1618,7 @@ def run_migration(db: Session = Depends(get_db)):
     - Coluna auto_topic_clone
     - [CLONEX] Limite de 50MB aplicado no engine (sem alteração de schema)
     - [FERRAMENTAS] Tabela ferramentas_jobs (Ferramentas de Criativos)
+    - [INSTAGRAM FARM] Tabelas instagram_accounts, instagram_posts, instagram_logs
     """
     from sqlalchemy import text, inspect
     
@@ -1655,6 +1684,29 @@ def run_migration(db: Session = Depends(get_db)):
             results.append("✅ Tabela 'ferramentas_jobs' criada! (Ferramentas de Criativos)")
         else:
             results.append("ℹ️ Tabela 'ferramentas_jobs' já existe.")
+
+        # ── INSTAGRAM FARM ─────────────────────────────────────────────────────
+
+        # 7. Cria tabela instagram_accounts se não existir
+        if "instagram_accounts" not in existing_tables:
+            Base.metadata.tables["instagram_accounts"].create(bind=engine)
+            results.append("✅ Tabela 'instagram_accounts' criada! (Instagram Farm)")
+        else:
+            results.append("ℹ️ Tabela 'instagram_accounts' já existe.")
+
+        # 8. Cria tabela instagram_posts se não existir
+        if "instagram_posts" not in existing_tables:
+            Base.metadata.tables["instagram_posts"].create(bind=engine)
+            results.append("✅ Tabela 'instagram_posts' criada! (Instagram Farm)")
+        else:
+            results.append("ℹ️ Tabela 'instagram_posts' já existe.")
+
+        # 9. Cria tabela instagram_logs se não existir
+        if "instagram_logs" not in existing_tables:
+            Base.metadata.tables["instagram_logs"].create(bind=engine)
+            results.append("✅ Tabela 'instagram_logs' criada! (Instagram Farm)")
+        else:
+            results.append("ℹ️ Tabela 'instagram_logs' já existe.")
         
         return {"status": "success", "migrations": results}
     
